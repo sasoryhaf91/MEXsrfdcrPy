@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+title: "MEXsrfdcrPy: Spatial Random Forest for Daily Climate Records Reconstruction in Mexico"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Antonio-Fernandez"
+    given-names: "Hugo"
+    orcid: "https://orcid.org/0000-0002-5355-8476"
+repository-code: "https://github.com/sasoryhaf91/MEXsrfdcrPy"
+license: "MIT"
+keywords:
+  - random forest
+  - climate
+  - rainfall
+  - temperature
+  - land evaporation
+  - Mexico
+version: "0.1.0"
+date-released: "2025-01-01"
