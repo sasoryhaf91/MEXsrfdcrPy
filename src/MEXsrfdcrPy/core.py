@@ -1,9 +1,7 @@
-"""Core public API for MEXsrfdcrPy."""
-
 def hello(name: str = "world") -> str:
-    """Return a friendly greeting."""
+    """Simple greeting (placeholder)."""
     return f"Hello, {name}!"
 
 def about() -> str:
-    """Short project blurb."""
+    """One-line package tagline."""
     return "MEXsrfdcrPy: Spatial RF for daily climate reconstruction in Mexico."
