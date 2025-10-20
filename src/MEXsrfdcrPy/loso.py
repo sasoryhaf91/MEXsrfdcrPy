@@ -1120,19 +1120,24 @@ def plot_compare_obs_rf_nasa(
     data: pd.DataFrame,
     *,
     station_id: int,
+    # columnas base
     id_col: str = "station",
     date_col: str = "date",
+    # columnas de series (pueden ser None)
     obs_col: Optional[str] = "tmax",
     nasa_col: Optional[str] = None,
     rf_df: Optional[pd.DataFrame] = None,
     rf_date_col: str = "date",
     rf_value_col: Optional[str] = "y_pred_full",
     rf_label: Optional[str] = "RF",
+    # recorte temporal
     start: Optional[str] = None,
     end: Optional[str] = None,
-    resample: Optional[str] = "D",
-    agg: Optional[str] = "mean",
-    smooth: Optional[int] = None,
+    # agregación / suavizado (None = sin aplicar)
+    resample: Optional[str] = "D",          # "D","M","YE" o None
+    agg: Optional[str] = "mean",            # "mean"|"sum"|"median" o None→"mean"
+    smooth: Optional[int] = None,           # ventana rolling
+    # estética y salida (opcionales)
     figsize: Optional[Tuple[int, int]] = (12, 5),
     title: Optional[str] = None,
     ylabel: Optional[str] = None,
@@ -1140,17 +1145,19 @@ def plot_compare_obs_rf_nasa(
     grid: Optional[bool] = True,
     xlim: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
     ylim: Optional[Tuple[float, float]] = None,
-    date_fmt: Optional[str] = None,
+    date_fmt: Optional[str] = None,         # p.ej. "%Y"
     save_to: Optional[str] = None,
-    obs_style: Optional[Dict] = None,
-    nasa_style: Optional[Dict] = None,
-    rf_style: Optional[Dict] = None,
+    # estilos por serie (dicts opcionales)
+    obs_style: Optional[Dict] = None,       # {"marker":"o","ms":3,"alpha":0.7,"color":"#37474F","ls":""}
+    nasa_style: Optional[Dict] = None,      # {"lw":2.0,"alpha":0.9,"color":"#B71C1C"}
+    rf_style: Optional[Dict] = None,        # {"lw":2.0,"alpha":0.9,"color":"#1E88E5"}
 ) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
     """
-    Flexible comparison plot for one station:
-    Observed (optional), external/NASA (optional), and RF model series.
-    Returns the (figure, axes, metrics_dict) where metrics are computed against observed.
+    Grafica OBS (opcional), NASA/externo (opcional) y RF (opcional).
+    Acepta None en cualquiera de las entradas. Devuelve (fig, ax, metrics),
+    donde 'metrics' solo contiene claves para series evaluadas CONTRA observado.
     """
+    # ---------- helpers ----------
     def _ensure_dt(s: pd.Series) -> pd.Series:
         if not np.issubdtype(s.dtype, np.datetime64):
             s = pd.to_datetime(s, errors="coerce")
@@ -1181,17 +1188,19 @@ def plot_compare_obs_rf_nasa(
             out = out.rolling(smooth, min_periods=1, center=True).mean()
         return out
 
+    # ---------- base ----------
     base = data.copy()
     if id_col in base.columns:
         base = base[base[id_col] == station_id]
     if base.empty:
-        raise ValueError(f"No data for station {station_id}.")
+        raise ValueError(f"No hay datos para estación {station_id}.")
     base = _clip_period(base, date_col)
 
-    series = {}
+    series = {}   # nombre -> Series indexadas por fecha
     labels = {}
     metrics: Dict[str, Dict[str, float]] = {}
 
+    # ---------- OBS (opcional) ----------
     if obs_col is not None and obs_col in base.columns:
         obs = base[[date_col, obs_col]].dropna().rename(columns={obs_col: "obs"})
         obs[date_col] = _ensure_dt(obs[date_col])
@@ -1200,6 +1209,7 @@ def plot_compare_obs_rf_nasa(
             series["obs"] = obs["obs"]
             labels["obs"] = "Observed"
 
+    # ---------- NASA (opcional) ----------
     if nasa_col is not None and nasa_col in base.columns:
         nasa = base[[date_col, nasa_col]].dropna().rename(columns={nasa_col: "nasa"})
         nasa[date_col] = _ensure_dt(nasa[date_col])
@@ -1208,6 +1218,7 @@ def plot_compare_obs_rf_nasa(
             series["nasa"] = nasa["nasa"]
             labels["nasa"] = f"{nasa_col}"
 
+    # ---------- RF (opcional) ----------
     if rf_df is not None and rf_value_col is not None and rf_value_col in rf_df.columns:
         rf = rf_df.copy()
         rf[rf_date_col] = _ensure_dt(rf[rf_date_col])
@@ -1219,8 +1230,9 @@ def plot_compare_obs_rf_nasa(
             labels["rf"] = rf_label or "RF"
 
     if len(series) == 0:
-        raise ValueError("Nothing to plot (all series are None or empty).")
+        raise ValueError("No hay ninguna serie para graficar (todas son None o vacías).")
 
+    # ---------- métricas (solo si hay OBS) ----------
     if "obs" in series:
         from numpy import nan
         def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
@@ -1237,20 +1249,23 @@ def plot_compare_obs_rf_nasa(
         if "rf" in series:
             metrics["rf"] = _pair_metrics(series["obs"], series["rf"])
 
+    # ---------- preparar para plot ----------
     for k in list(series.keys()):
         series[k] = _prep_series(series[k])
 
+    # estilos por defecto (se pueden sobrescribir con *_style)
     obs_style  = dict({"marker":"o","ms":3,"alpha":0.7,"color":"#37474F","ls":""}, **(obs_style or {}))
     nasa_style = dict({"lw":2.0,"alpha":0.9,"color":"#B71C1C"}, **(nasa_style or {}))
     rf_style   = dict({"lw":2.0,"alpha":0.9,"color":"#1E88E5"}, **(rf_style or {}))
 
+    # ---------- plot ----------
     fig, ax = plt.subplots(figsize=figsize or (12, 5))
 
     if "obs" in series:
         ax.plot(series["obs"].index, series["obs"].values, label=labels["obs"], **obs_style)
     if "nasa" in series:
         lbl = labels["nasa"]
-        if "nasa" in metrics:
+        if "nasa" in metrics:  # añade métricas a la etiqueta
             m = metrics["nasa"]
             lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
         ax.plot(series["nasa"].index, series["nasa"].values, label=lbl, **nasa_style)
@@ -1261,7 +1276,9 @@ def plot_compare_obs_rf_nasa(
             lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
         ax.plot(series["rf"].index, series["rf"].values, label=lbl, **rf_style)
 
+    # títulos / ejes
     if title is None:
+        # intenta inferir etiqueta del eje si hay observado
         ylab = (ylabel if ylabel is not None else (obs_col.upper() if obs_col else "Value"))
         title = f"Station {station_id} — {ylab}"
     ax.set_title(title)
@@ -1271,10 +1288,12 @@ def plot_compare_obs_rf_nasa(
 
     if grid:
         ax.grid(ls=":", alpha=0.5)
+
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
+
     if date_fmt is not None:
         import matplotlib.dates as mdates
         ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
