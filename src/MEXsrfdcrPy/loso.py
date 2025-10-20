@@ -1305,121 +1305,193 @@ def plot_compare_obs_rf_nasa(
 
     return fig, ax, metrics
 
-# =========================
-# FAST + % objetivo → serie completa
-# =========================
+
+# --- FAST full-series LOSO (neighbors + single-pass prep) --------------------
 def loso_predict_full_series_fast(
     data: pd.DataFrame,
     station_id: int,
     *,
-    # columnas
-    id_col: str = "estacion",
-    date_col: str = "fecha",
-    lat_col: str = "latitud",
-    lon_col: str = "longitud",
-    alt_col: str = "altitud",
-    target_col: str = "precipitacion",
-    # periodo de la SERIE a entregar (predicha completa)
-    start: str = "1961-01-01",
+    # columns
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    # periods
+    start: str = "1961-01-01",           # full-series prediction window
     end: str = "2023-12-31",
-    # (opcional) periodo para ENTRENAR
-    train_start: str | None = None,
-    train_end: str | None = None,
-    # modelo / features
+    train_start: Optional[str] = None,   # optional training window
+    train_end: Optional[str] = None,
+    # model
     rf_params: Dict = dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1),
     add_cyclic: bool = False,
     feature_cols: Optional[List[str]] = None,
-    # filtros “FAST”
-    prefix: Optional[Iterable[str] | str] = None,
-    station_ids: Optional[Iterable[int]] = None,
-    regex: Optional[str] = None,
-    custom_filter: Optional[Callable[[int], bool]] = None,
-    # aceleración por vecindad
+    var_cols: Optional[Iterable[str]] = None,     # extra covariates (resolved if present)
+    # neighbors
     k_neighbors: Optional[int] = None,
     neighbor_map: Optional[Dict[int, List[int]]] = None,
-    # correlaciones
-    min_overlap_corr: int = 60,
-    # -------- NUEVO --------
-    include_target_pct: float = 0.0,        # 0 = LOSO; 100 = usa todo el objetivo en train
+    # target leakage control
+    include_target_pct: float = 0.0,
     include_target_seed: int = 42,
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str], Optional[pd.DataFrame]]:
+    # I/O
+    save_series_path: Optional[str] = None,
+    save_metrics_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
     """
-    FAST + % de la estación objetivo en entrenamiento.
-    Predice serie diaria COMPLETA en [start,end] (y_pred_full) y añade y_true donde exista.
+    Fast LOSO full-series prediction for one station.
+
+    - Trains on all stations except the target (optionally only its k nearest neighbors).
+    - Optionally includes a percentage of target rows in training (include_target_pct).
+    - Predicts a continuous daily series [start, end] at the station's median coordinates.
+    - Returns (full_df, metrics, fitted_model, feature_cols).
+
+    full_df columns:
+        [date, station, y_pred_full, y_true?]
+    Metrics are computed only where y_true exists (safe R²).
     """
+    # 1) Ensure datetime, and optionally clip a training window
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    if start or end:
-        lo = pd.to_datetime(start) if start else df[date_col].min()
-        hi = pd.to_datetime(end) if end else df[date_col].max()
-        df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
-
-    selected = select_stations(
-        df, id_col=id_col, prefix=prefix, station_ids=station_ids, regex=regex, custom_filter=custom_filter
-    )
-    if selected:
-        df = df[df[id_col].isin(selected + [station_id])]
-
-    corr_tab = None
-    if k_neighbors is not None:
-        if neighbor_map is None:
-            neighbor_map = build_station_kneighbors(df, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors)
-        neigh_ids = neighbor_map.get(station_id, [])
-        df_train_pool = df[df[id_col].isin(neigh_ids)].copy()
-        df_target_all = df[df[id_col] == station_id].copy()
-        df_local = pd.concat([df_train_pool, df_target_all], axis=0, copy=False)
-        if len(neigh_ids) > 0:
-            corr_tab = neighbor_correlation_table(
-                df_local, station_id, neigh_ids, id_col=id_col, date_col=date_col, value_col=target_col,
-                start=start, end=end, min_overlap=min_overlap_corr
-            )
-    else:
-        df_local = df
+    if pd.api.types.is_datetime64tz_dtype(df[date_col]):
+        df[date_col] = df[date_col].dt.tz_localize(None)
+    df = df.dropna(subset=[date_col])
 
     if train_start or train_end:
-        lo = pd.to_datetime(train_start) if train_start else df_local[date_col].min()
-        hi = pd.to_datetime(train_end)   if train_end   else df_local[date_col].max()
-        df_local = df_local[(df_local[date_col] >= lo) & (df_local[date_col] <= hi)]
+        lo = pd.to_datetime(train_start) if train_start else df[date_col].min()
+        hi = pd.to_datetime(train_end) if train_end else df[date_col].max()
+        train_base = df[(df[date_col] >= lo) & (df[date_col] <= hi)].copy()
+    else:
+        train_base = df.copy()
 
-    df_local = _add_time_features(_ensure_datetime(df_local, date_col), date_col, add_cyclic=add_cyclic)
+    # 2) Build neighbor map if requested
+    if k_neighbors is not None and neighbor_map is None:
+        neighbor_map = build_station_kneighbors(
+            train_base, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors
+        )
+
+    # 3) Add time features and resolve covariates in ONE pass
+    train_base["year"] = train_base[date_col].dt.year
+    train_base["month"] = train_base[date_col].dt.month
+    train_base["doy"] = train_base[date_col].dt.dayofyear
+    if add_cyclic:
+        train_base["doy_sin"] = np.sin(2 * np.pi * train_base["doy"] / 365.25)
+        train_base["doy_cos"] = np.cos(2 * np.pi * train_base["doy"] / 365.25)
+
+    resolved_vars = _resolve_columns(train_base, var_cols)
+
     if feature_cols is None:
-        feature_cols = [lat_col, lon_col, alt_col, "año", "mes", "dia_del_año"] + (["doy_sin","doy_cos"] if add_cyclic else [])
+        feats = [lat_col, lon_col, alt_col, "year", "month", "doy"]
+        if add_cyclic:
+            feats += ["doy_sin", "doy_cos"]
+        feats += resolved_vars
+    else:
+        feats = list(feature_cols)
 
-    train_rest = df_local[df_local[id_col] != station_id]
-    sample_target = _sample_target_for_training(
-        df_local, id_col=id_col, date_col=date_col, target_col=target_col, feature_cols=feature_cols,
-        station_id=station_id, include_target_pct=include_target_pct, random_state=include_target_seed
-    )
-    train_df = pd.concat([train_rest, sample_target], axis=0, copy=False)
-    train_df = train_df.dropna(subset=feature_cols + [target_col])
+    # 4) Training pool: all except target (or only its neighbors)
+    is_target = train_base[id_col] == station_id
+    if k_neighbors is not None:
+        neigh_ids = (neighbor_map or {}).get(station_id, [])
+        train_pool_mask = train_base[id_col].isin(neigh_ids) & (~is_target)
+    else:
+        train_pool_mask = ~is_target
+
+    train_pool = train_base.loc[train_pool_mask]
+
+    # 5) Optional inclusion of target rows in training (from the train window)
+    pct = max(0.0, min(float(include_target_pct), 100.0))
+    if pct > 0.0:
+        tgt_rows = train_base.loc[is_target]
+        # keep rows with all required features and target present
+        tgt_rows = tgt_rows.dropna(subset=feats + [target_col])
+        if not tgt_rows.empty:
+            n_take = int(np.ceil(len(tgt_rows) * (pct / 100.0)))
+            sample_tgt = tgt_rows.sample(n=n_take, random_state=include_target_seed)
+            train_df = pd.concat([train_pool, sample_tgt], axis=0, copy=False)
+        else:
+            train_df = train_pool
+    else:
+        train_df = train_pool
+
+    train_df = train_df.dropna(subset=feats + [target_col])
     if train_df.empty:
-        raise ValueError("El conjunto de entrenamiento quedó vacío tras filtrar/muestrear.")
+        raise ValueError("Training set is empty after filtering (check features, neighbors, or periods).")
 
+    # 6) Station coordinates (median)
     st = df[df[id_col] == station_id]
     if st.empty:
-        raise ValueError(f"No hay registros para la estación {station_id} en el periodo.")
-    lat0, lon0, alt0 = st[lat_col].median(), st[lon_col].median(), st[alt_col].median()
+        raise ValueError(f"No rows for station {station_id} in the input data.")
+    lat0 = float(st[lat_col].median())
+    lon0 = float(st[lon_col].median())
+    alt0 = float(st[alt_col].median())
 
-    dates = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq="D")
-    synth = pd.DataFrame({date_col: dates, "estacion": station_id, lat_col: lat0, lon_col: lon0, alt_col: alt0})
-    synth = _add_time_features(synth, date_col, add_cyclic=add_cyclic)
-
+    # 7) Fit model
     model = RandomForestRegressor(**rf_params)
-    model.fit(train_df[feature_cols], train_df[target_col])
-    y_pred_full = model.predict(synth[feature_cols])
+    X_train = train_df[feats].to_numpy(copy=False)
+    y_train = train_df[target_col].to_numpy(copy=False)
+    model.fit(X_train, y_train)
 
-    full_df = synth[[date_col, "estacion"]].copy()
+    # 8) Predict full continuous daily series on [start, end]
+    dates = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq="D")
+    synth = pd.DataFrame(
+        {date_col: dates, "station": station_id, lat_col: lat0, lon_col: lon0, alt_col: alt0}
+    )
+    # add same time features
+    synth["year"] = synth[date_col].dt.year
+    synth["month"] = synth[date_col].dt.month
+    synth["doy"] = synth[date_col].dt.dayofyear
+    if add_cyclic:
+        synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
+        synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
+
+    y_pred_full = model.predict(synth[feats])
+    full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
+
+    # 9) Merge observed values (for scoring wherever available)
     obs = df[df[id_col] == station_id][[date_col, target_col]].rename(columns={target_col: "y_true"})
     full_df = full_df.merge(obs, on=date_col, how="left")
 
+    # 10) Metrics (only on overlapping observed days)
     comp = full_df.dropna(subset=["y_true"]).copy()
-    comp["y_pred"] = comp["y_pred_full"]
-    daily = _metrics(comp["y_true"], comp["y_pred"])
-    monthly, _ = _aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg="sum")
-    annual, _ = _aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg="sum")
+    if not comp.empty:
+        comp["y_pred"] = comp["y_pred_full"]
+        daily = _safe_metrics(comp["y_true"], comp["y_pred"])
+        monthly, _ = aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg="sum")
+        annual, _ = aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg="sum")
+    else:
+        daily = {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
+        monthly = {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
+        annual = {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
+
     metrics = {"daily": daily, "monthly": monthly, "annual": annual}
 
-    return full_df, metrics, model, feature_cols, corr_tab
+    # 11) Optional saves
+    _save_df(full_df, save_series_path, parquet_compression=parquet_compression)
+    _save_json(metrics, save_metrics_path)
 
+    return full_df, metrics, model, feats
 
+__all__ = [
+    # core & full series
+    "loso_train_predict_station",
+    "loso_predict_full_series",
+    "loso_predict_full_series_fast",   # <-- añade esto
+    # evaluation
+    "evaluate_all_stations",
+    "evaluate_all_stations_fast",
+    # export
+    "export_full_series_station",
+    "export_full_series_batch",
+    # helpers
+    "select_stations",
+    "build_station_kneighbors",
+    "neighbor_correlation_table",
+    "plot_compare_obs_rf_nasa",
+    # utility
+    "ensure_datetime",
+    "add_time_features",
+    "aggregate_and_score",
+    "set_warning_policy",
+]
