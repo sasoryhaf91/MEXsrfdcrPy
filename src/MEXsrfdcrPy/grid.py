@@ -87,7 +87,7 @@ station | date       | y_pred_full | latitude | longitude | altitude
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import json
 import os
@@ -98,12 +98,17 @@ from joblib import dump, load
 from sklearn.ensemble import RandomForestRegressor
 
 
+
+
+
 __all__ = [
     "GlobalModelMeta",
     "train_global_rf_target",
     "predict_grid_daily_with_global_model",
     "slice_station_series",
     "grid_nan_report",
+    "predict_points_daily_with_global_model",
+    "predict_at_point_daily_with_global_model"
 ]
 
 
@@ -545,4 +550,231 @@ def grid_nan_report(
     required = [id_col, lat_col, lon_col, alt_col]
     report = {c: int(grid_df[c].isna().sum()) if c in grid_df.columns else None for c in required}
     return pd.DataFrame([report])
+
+def _normalize_points_to_grid_df(
+    points: Union[
+        pd.DataFrame,
+        dict,
+        Tuple[float, float, float],
+        Sequence[dict],
+        Sequence[Tuple[float, float, float]],
+        Sequence[Tuple[Union[int, str], float, float, float]],
+    ],
+    *,
+    grid_id_col: str = "station",
+    grid_lat_col: str = "latitude",
+    grid_lon_col: str = "longitude",
+    grid_alt_col: str = "altitude",
+) -> pd.DataFrame:
+    """
+    Normalize arbitrary point inputs into a 4-column grid DataFrame:
+    [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col].
+
+    Accepted inputs:
+    - DataFrame with columns (station, latitude, longitude, altitude)
+    - dict or list[dict] with keys matching the column names
+    - list of tuples (lat, lon, alt)  -> station ids are auto-assigned 1..N
+    - list of tuples (station, lat, lon, alt)
+
+    Returns
+    -------
+    DataFrame with the four standard columns, dtype-coerced, no duplicates.
+    """
+    def _as_df(obj) -> pd.DataFrame:
+        if isinstance(obj, pd.DataFrame):
+            cols_need = {grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col}
+            missing = cols_need - set(obj.columns)
+            if missing:
+                raise ValueError(f"Input DataFrame is missing columns: {missing}")
+            return obj[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
+
+        # single dict
+        if isinstance(obj, dict):
+            return pd.DataFrame([obj])
+
+        # sequence (dicts or tuples)
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 0:
+                raise ValueError("Empty points sequence.")
+            first = obj[0]
+
+            # list of dicts
+            if isinstance(first, dict):
+                return pd.DataFrame(obj)
+
+            # list of tuples
+            arr = list(obj)
+            # (lat, lon, alt)
+            if len(first) == 3:
+                df = pd.DataFrame(arr, columns=[grid_lat_col, grid_lon_col, grid_alt_col])
+                df.insert(0, grid_id_col, np.arange(1, len(df) + 1))
+                return df
+            # (station, lat, lon, alt)
+            if len(first) == 4:
+                df = pd.DataFrame(arr, columns=[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col])
+                return df
+
+        # single tuple
+        if isinstance(obj, tuple):
+            if len(obj) == 3:
+                lat, lon, alt = obj
+                return pd.DataFrame([{grid_id_col: 1, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}])
+            if len(obj) == 4:
+                sid, lat, lon, alt = obj
+                return pd.DataFrame([{grid_id_col: sid, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}])
+
+        raise TypeError(
+            "Unsupported `points` format. Use DataFrame, dict, "
+            "list[dict], list[(lat,lon,alt)], or list[(station,lat,lon,alt)]."
+        )
+
+    df = _as_df(points)
+
+    # Coerce dtypes and basic validation
+    df = df.copy()
+    df[grid_id_col] = pd.Index(df[grid_id_col])
+    for c in (grid_lat_col, grid_lon_col, grid_alt_col):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if df[[grid_lat_col, grid_lon_col, grid_alt_col]].isna().any().any():
+        raise ValueError("Some coordinates could not be converted to numeric (NaN present).")
+
+    # Drop duplicated stations if any
+    if df[grid_id_col].duplicated().any():
+        raise ValueError("Duplicated station identifiers in points.")
+
+    return df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].reset_index(drop=True)
+
+
+def predict_points_daily_with_global_model(
+    points: Union[
+        pd.DataFrame,
+        dict,
+        Tuple[float, float, float],
+        Sequence[dict],
+        Sequence[Tuple[float, float, float]],
+        Sequence[Tuple[Union[int, str], float, float, float]],
+    ],
+    *,
+    # persisted artifacts
+    model_path: str = "models/global_rf_model.joblib",
+    meta_path: str = "models/global_rf_model.meta.json",
+    # column names for the normalized grid
+    grid_id_col: str = "station",
+    grid_lat_col: str = "latitude",
+    grid_lon_col: str = "longitude",
+    grid_alt_col: str = "altitude",
+    # time span
+    start: str = "1991-01-01",
+    end: str = "2020-12-31",
+    # memory control
+    batch_days: int = 365,
+    # optional output
+    out_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> pd.DataFrame:
+    """
+    Predict daily series for one or many arbitrary points using the saved global model.
+
+    This is a convenience wrapper around `predict_grid_daily_with_global_model`
+    that accepts flexible point specifications (DataFrame, dicts, tuples) and
+    returns a long-format DataFrame including coordinates.
+
+    Parameters
+    ----------
+    points
+        One of:
+        - DataFrame with [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]
+        - dict with those keys
+        - list[dict] with those keys
+        - list[(lat, lon, alt)]   -> station ids auto-assigned 1..N
+        - list[(station, lat, lon, alt)]
+        - single tuple (lat, lon, alt) or (station, lat, lon, alt)
+    model_path, meta_path
+        Paths to persisted model and metadata.
+    grid_*_col
+        Column names to use in the normalized grid.
+    start, end
+        Inclusive date span for predictions (YYYY-MM-DD).
+    batch_days
+        Number of days per time-batch (RAM/speed trade-off).
+    out_path
+        Optional parquet path for saving predictions.
+    parquet_compression
+        Parquet codec when saving.
+
+    Returns
+    -------
+    preds : DataFrame
+        Long-format [station, latitude, longitude, altitude, date, y_pred_full].
+    """
+    # normalize inputs to a proper grid dataframe
+    grid_df = _normalize_points_to_grid_df(
+        points,
+        grid_id_col=grid_id_col,
+        grid_lat_col=grid_lat_col,
+        grid_lon_col=grid_lon_col,
+        grid_alt_col=grid_alt_col,
+    )
+
+    # call the existing grid predictor (which should already include coords in output)
+    preds = predict_grid_daily_with_global_model(
+        grid_df=grid_df,
+        model_path=model_path,
+        meta_path=meta_path,
+        grid_id_col=grid_id_col,
+        grid_lat_col=grid_lat_col,
+        grid_lon_col=grid_lon_col,
+        grid_alt_col=grid_alt_col,
+        start=start,
+        end=end,
+        batch_days=batch_days,
+        out_path=out_path,
+        parquet_compression=parquet_compression,
+    )
+    return preds
+
+
+def predict_at_point_daily_with_global_model(
+    *,
+    latitude: float,
+    longitude: float,
+    altitude: float,
+    station: Union[int, str] = 1,
+    model_path: str = "models/global_rf_model.joblib",
+    meta_path: str = "models/global_rf_model.meta.json",
+    start: str = "1991-01-01",
+    end: str = "2020-12-31",
+    batch_days: int = 365,
+    out_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> pd.DataFrame:
+    """
+    Predict the daily series at a single point (lat/lon/alt) using the saved global model.
+
+    Parameters
+    ----------
+    latitude, longitude, altitude
+        Point coordinates.
+    station
+        Identifier to assign to this point (default=1).
+    model_path, meta_path, start, end, batch_days, out_path, parquet_compression
+        See `predict_points_daily_with_global_model`.
+
+    Returns
+    -------
+    preds : DataFrame
+        Long-format [station, latitude, longitude, altitude, date, y_pred_full].
+    """
+    pts = [(station, float(latitude), float(longitude), float(altitude))]
+    return predict_points_daily_with_global_model(
+        pts,
+        model_path=model_path,
+        meta_path=meta_path,
+        start=start,
+        end=end,
+        batch_days=batch_days,
+        out_path=out_path,
+        parquet_compression=parquet_compression,
+    )
+
 
