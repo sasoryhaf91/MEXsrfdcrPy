@@ -469,7 +469,7 @@ def predict_grid_daily_with_global_model(
             out["y_pred_full"] = y_hat.astype("float32")
 
             # Column order
-            out = out[[grid_id_col, "date", "y_pred_full", grid_lat_col, grid_lon_col, grid_alt_col]]
+            out = out[[grid_id_col, "date", grid_lat_col, grid_lon_col, grid_alt_col, "y_pred_full"]]
 
             # Accumulate or stream
             if out_path is None:
