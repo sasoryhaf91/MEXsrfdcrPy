@@ -1,4 +1,4 @@
-# src/MEXsrfdcrPy/global.py
+# src/MEXsrfdcrPy/gie.py
 """
 Global precipitation model and grid prediction utilities.
 
