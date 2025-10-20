@@ -20,130 +20,343 @@ Dependencies:
 """
 
 from __future__ import annotations
+
 import os
+import re
 import json
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+import time
+import warnings
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
 
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.neighbors import KDTree
 
-# Local imports from the core LOSO module
-from .loso import (
-    ensure_datetime, add_time_features, resolve_columns, _save_df, _save_json,
-    evaluate_all_stations_fast, build_station_kneighbors,
-    aggregate_and_score, _safe_metrics
-)
-
-# ---------------------------------------------------------------------
-# I/O helpers
-# ---------------------------------------------------------------------
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def save_df(df: pd.DataFrame, path: Optional[str], *, parquet_compression: str = "snappy") -> Optional[str]:
-    """Save a dataframe to CSV/Parquet/Feather/XLSX depending on file extension."""
-    return _save_df(df, path, parquet_compression=parquet_compression)
-
-
-def save_json(obj: dict, path: Optional[str]) -> Optional[str]:
-    """Save a dict as JSON if path is provided."""
-    return _save_json(obj, path)
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):
+        return x
 
 
 # ---------------------------------------------------------------------
-# Dataset union and normalization
+# Warning policy
 # ---------------------------------------------------------------------
-def union_with_source(
-    df_smn: pd.DataFrame,
-    df_nasa: pd.DataFrame,
-    *,
-    # incoming column names for each source
-    id_col_smn: str = "station",
-    date_col_smn: str = "date",
-    lat_col_smn: str = "latitude",
-    lon_col_smn: str = "longitude",
-    alt_col_smn: str = "altitude",
-    id_col_nasa: str = "station",
-    date_col_nasa: str = "date",
-    lat_col_nasa: str = "latitude",
-    lon_col_nasa: str = "longitude",
-    alt_col_nasa: str = "altitude",
-    # variable mappings for NASA → canonical
-    nasa_to_canonical: Optional[Dict[str, str]] = None,
-    # canonical names to produce
-    id_col: str = "station",
-    date_col: str = "date",
-    lat_col: str = "latitude",
-    lon_col: str = "longitude",
-    alt_col: str = "altitude",
-) -> pd.DataFrame:
-    """
-    Return a unified long-format table containing both sources with a `source` tag.
+def set_warning_policy(silence: bool = True) -> None:
+    warnings.resetwarnings()
+    if silence:
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        try:
+            from sklearn.exceptions import UndefinedMetricWarning
+            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+        except Exception:
+            pass
 
-    Notes
-    -----
-    - The function *does not* aggregate duplicates; it concatenates rows from both sources.
-    - NASA variables are renamed using `nasa_to_canonical`, e.g.:
-          {"T2M_MIN":"tmin", "T2M_MAX":"tmax", "PRECTOTCORR":"prec", "EVLAND":"evap"}
-    - Missing canonical variables are left as-is if already present in the input dataframes.
-    """
-    nasa_to_canonical = nasa_to_canonical or {}
 
-    # Normalize SMN columns
-    smn = df_smn.copy()
-    smn = smn.rename(columns={
-        id_col_smn: id_col, date_col_smn: date_col,
-        lat_col_smn: lat_col, lon_col_smn: lon_col, alt_col_smn: alt_col
-    })
-    smn["source"] = "smn"
+set_warning_policy(True)
 
-    # Normalize NASA columns and variables
-    nasa = df_nasa.copy()
-    nasa = nasa.rename(columns={
-        id_col_nasa: id_col, date_col_nasa: date_col,
-        lat_col_nasa: lat_col, lon_col_nasa: lon_col, alt_col_nasa: alt_col,
-        **nasa_to_canonical
-    })
-    nasa["source"] = "nasa"
 
-    # Keep a consistent set of columns: metadata + all variables we find
-    meta = [id_col, date_col, lat_col, lon_col, alt_col, "source"]
-    vars_all = sorted(set([c for c in smn.columns if c not in meta] + [c for c in nasa.columns if c not in meta]))
-    keep = meta + vars_all
+# ---------------------------------------------------------------------
+# Small I/O helpers (internal)
+# ---------------------------------------------------------------------
+def _ensure_parent_dir(path: Optional[str]) -> None:
+    if not path:
+        return
+    d = os.path.dirname(str(path)) or "."
+    os.makedirs(d, exist_ok=True)
 
-    out = pd.concat([smn[keep].copy(), nasa[keep].copy()], axis=0, ignore_index=True)
-    out = ensure_datetime(out, date_col)
+
+def _save_df(df: pd.DataFrame, path: Optional[str], *, parquet_compression: str = "snappy") -> Optional[str]:
+    if path is None:
+        return None
+    _ensure_parent_dir(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        df.to_csv(path, index=False)
+    elif ext == ".parquet":
+        df.to_parquet(path, index=False, compression=parquet_compression)
+    elif ext == ".feather":
+        df.to_feather(path)
+    else:
+        raise ValueError(f"Unsupported extension: {ext}")
+    return path
+
+
+def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    _ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    return path
+
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
+    """Resolve columns from a string or list, case-insensitive. Ignores missing."""
+    if cols is None:
+        return []
+    if isinstance(cols, str):
+        cols = [cols]
+    lower_map = {c.lower(): c for c in df.columns}
+    aliases = {"pretotcorr": "prectotcorr"}  # common alias
+    out = []
+    for raw in cols:
+        if raw is None:
+            continue
+        key = aliases.get(str(raw).lower(), str(raw).lower())
+        if key in lower_map:
+            out.append(lower_map[key])
     return out
 
 
+def ensure_datetime(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(out[date_col]):
+        out[date_col] = out[date_col].dt.tz_localize(None)
+    return out.dropna(subset=[date_col])
+
+
+def add_time_features(df: pd.DataFrame, date_col: str = "date", add_cyclic: bool = False) -> pd.DataFrame:
+    out = df.copy()
+    out["year"] = out[date_col].dt.year
+    out["month"] = out[date_col].dt.month
+    out["doy"] = out[date_col].dt.dayofyear
+    if add_cyclic:
+        out["doy_sin"] = np.sin(2 * np.pi * out["doy"] / 365.25)
+        out["doy_cos"] = np.cos(2 * np.pi * out["doy"] / 365.25)
+    return out
+
+
+def _safe_metrics(y_true: Iterable[float], y_pred: Iterable[float]) -> Dict[str, float]:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
+        r2 = r2_score(y_true, y_pred)
+    else:
+        r2 = np.nan
+    return {"MAE": mae, "RMSE": rmse, "R2": r2}
+
+
+_FREQ_ALIAS = {"M": "ME", "A": "YE", "Y": "YE", "Q": "QE"}
+
+
+def aggregate_and_score(
+    df_pred: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    y_col: str = "y_true",
+    yhat_col: str = "y_pred",
+    freq: str = "M",
+    agg: str = "sum",
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """Resample and score (safe R²)."""
+    freq = _FREQ_ALIAS.get(freq, freq)
+    aggfunc = {"sum": "sum", "mean": "mean", "median": "median"}[agg]
+
+    df = df_pred[[date_col, y_col, yhat_col]].dropna(subset=[date_col]).copy()
+    if df.empty:
+        return {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}, df
+
+    df = df.set_index(date_col).sort_index()
+    agg_df = df.resample(freq).agg({y_col: aggfunc, yhat_col: aggfunc}).dropna()
+    if agg_df.empty:
+        return {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}, agg_df
+
+    m = _safe_metrics(agg_df[y_col].values, agg_df[yhat_col].values)
+    return m, agg_df
+
+
 # ---------------------------------------------------------------------
-# Training (global RF per variable, no LOSO) and grid inference
+# Station selection & neighbors
 # ---------------------------------------------------------------------
-def fit_rf_global(
+def select_stations(
     data: pd.DataFrame,
     *,
+    id_col: str = "station",
+    prefix: Optional[Iterable[str] | str] = None,
+    station_ids: Optional[Iterable[int]] = None,
+    regex: Optional[str] = None,
+    custom_filter: Optional[Callable[[int], bool]] = None,
+) -> List[int]:
+    ids = data[id_col].dropna().astype(int).unique().tolist()
+    chosen = set()
+
+    if prefix is not None:
+        if isinstance(prefix, str):
+            prefix = [prefix]
+        for p in prefix:
+            chosen.update([i for i in ids if str(i).startswith(str(p))])
+
+    if station_ids is not None:
+        chosen.update([int(i) for i in station_ids])
+
+    if regex is not None:
+        pat = re.compile(regex)
+        chosen.update([i for i in ids if pat.match(str(i))])
+
+    if custom_filter is not None:
+        chosen.update([i for i in ids if custom_filter(i)])
+
+    if not chosen:
+        chosen = set(ids)
+    return sorted(chosen)
+
+
+def build_station_kneighbors(
+    data: pd.DataFrame,
+    *,
+    id_col: str = "station",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    k: int = 100,
+) -> Dict[int, List[int]]:
+    centroids = (
+        data.groupby(id_col)[[lat_col, lon_col]]
+        .median()
+        .rename(columns={lat_col: "lat", lon_col: "lon"})
+        .reset_index()
+    )
+    X = np.deg2rad(centroids[["lat", "lon"]].values)
+    tree = KDTree(X, metric="euclidean")
+    _, idx = tree.query(X, k=min(k + 1, len(centroids)))
+    neighbors = {}
+    ids = centroids[id_col].tolist()
+    for i, st in enumerate(ids):
+        neigh_idx = idx[i][1:]  # drop self
+        neighbors[st] = centroids.iloc[neigh_idx][id_col].tolist()
+    return neighbors
+
+
+def neighbor_correlation_table(
+    data: pd.DataFrame,
+    station_id: int,
+    neighbor_ids: Iterable[int],
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    value_col: str = "prec",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    min_overlap: int = 60,
+    save_table_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> pd.DataFrame:
+    if not neighbor_ids:
+        res = pd.DataFrame(columns=["neighbor", "corr", "n_overlap"])
+        _save_df(res, save_table_path, parquet_compression=parquet_compression)
+        return res
+
+    df = data[[id_col, date_col, value_col]].copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if start or end:
+        lo = pd.to_datetime(start) if start else df[date_col].min()
+        hi = pd.to_datetime(end) if end else df[date_col].max()
+        df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
+
+    ids_needed = set([int(station_id)] + [int(x) for x in neighbor_ids])
+    df = df[df[id_col].isin(ids_needed)]
+
+    wide = df.pivot_table(index=date_col, columns=id_col, values=value_col, aggfunc="mean")
+    try:
+        wide.columns = wide.columns.astype(int)
+    except Exception:
+        pass
+
+    if station_id not in wide.columns:
+        res = pd.DataFrame(columns=["neighbor", "corr", "n_overlap"])
+        _save_df(res, save_table_path, parquet_compression=parquet_compression)
+        return res
+
+    s_main = wide[station_id]
+    rows = []
+    for nid in neighbor_ids:
+        if nid not in wide.columns:
+            rows.append({"neighbor": int(nid), "corr": np.nan, "n_overlap": 0})
+            continue
+        pair = pd.concat([s_main, wide[nid]], axis=1, join="inner").dropna()
+        n = int(len(pair))
+        if n < min_overlap:
+            corr = np.nan
+        else:
+            a, b = pair.iloc[:, 0].values, pair.iloc[:, 1].values
+            if np.std(a) == 0 or np.std(b) == 0:
+                corr = np.nan
+            else:
+                corr = float(np.corrcoef(a, b)[0, 1])
+        rows.append({"neighbor": int(nid), "corr": corr, "n_overlap": n})
+
+    res = pd.DataFrame(rows).sort_values("corr", ascending=False, na_position="last").reset_index(drop=True)
+    _save_df(res, save_table_path, parquet_compression=parquet_compression)
+    return res
+
+
+# ---------------------------------------------------------------------
+# Target sampling helper
+# ---------------------------------------------------------------------
+def sample_target_for_training(
+    df: pd.DataFrame,
+    *,
+    id_col: str,
+    date_col: str,
     target_col: str,
-    feature_cols: Optional[List[str]] = None,
-    add_cyclic: bool = True,
+    feature_cols: List[str],
+    station_id: int,
+    include_target_pct: float,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    pct = max(0.0, min(float(include_target_pct), 100.0))
+    if pct <= 0.0:
+        return df.iloc[0:0].copy()
+    df_t = df[df[id_col] == station_id].copy()
+    ok = (~df_t[target_col].isna()) & (~df_t[feature_cols].isna().any(axis=1))
+    df_t = df_t.loc[ok]
+    if df_t.empty:
+        return df_t
+    n = int(np.ceil(len(df_t) * (pct / 100.0)))
+    return df_t.sample(n=n, random_state=random_state)
+
+
+# ---------------------------------------------------------------------
+# Core LOSO (observed days)
+# ---------------------------------------------------------------------
+def loso_train_predict_station(
+    data: pd.DataFrame,
+    station_id: int,
+    *,
     id_col: str = "station",
     date_col: str = "date",
     lat_col: str = "latitude",
     lon_col: str = "longitude",
     alt_col: str = "altitude",
-    rf_params: Dict = dict(n_estimators=400, random_state=42, n_jobs=-1)
-) -> Tuple[RandomForestRegressor, List[str], pd.DataFrame]:
-    """
-    Fit a *global* RandomForest on all available rows for `target_col` (no LOSO).
+    target_col: str = "prec",
+    feature_cols: Optional[List[str]] = None,
+    add_cyclic: bool = False,
+    model=None,
+    rf_params: Optional[Dict] = None,
+    agg_for_metrics: str = "sum",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_predictions_path: Optional[str] = None,
+    save_metrics_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+    if model is None:
+        rf_params = rf_params or dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1)
+        model = RandomForestRegressor(**rf_params)
 
-    Recommended when you need a fast model to infer values on a grid for many days.
-
-    Returns
-    -------
-    model, feature_cols_used, training_dataframe
-    """
     df = ensure_datetime(data, date_col)
     df = add_time_features(df, date_col, add_cyclic=add_cyclic)
 
@@ -152,359 +365,962 @@ def fit_rf_global(
         if add_cyclic:
             feature_cols += ["doy_sin", "doy_cos"]
 
-    train_df = df.dropna(subset=feature_cols + [target_col])
+    test_df = df[df[id_col] == station_id].copy()
+    if start or end:
+        if not test_df.empty:
+            lo = pd.to_datetime(start) if start else test_df[date_col].min()
+            hi = pd.to_datetime(end) if end else test_df[date_col].max()
+            test_df = test_df[(test_df[date_col] >= lo) & (test_df[date_col] <= hi)]
+    if test_df.empty:
+        raise ValueError("Target station has no rows in the requested period.")
+
+    train_rest = df[df[id_col] != station_id].copy()
+    sample_t = sample_target_for_training(
+        df,
+        id_col=id_col,
+        date_col=date_col,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        station_id=station_id,
+        include_target_pct=include_target_pct,
+        random_state=include_target_seed,
+    )
+    train_df = pd.concat([train_rest, sample_t], axis=0, copy=False)
+
+    train_df = train_df.dropna(subset=feature_cols + [target_col])
+    test_df = test_df.dropna(subset=feature_cols + [target_col])
     if train_df.empty:
-        raise ValueError(f"No valid rows to train for target '{target_col}'.")
+        raise ValueError("Training set is empty after filtering.")
 
-    X = train_df[feature_cols].to_numpy(copy=False)
-    y = train_df[target_col].to_numpy(copy=False)
+    X_train = train_df[feature_cols].to_numpy(copy=False)
+    y_train = train_df[target_col].to_numpy(copy=False)
+    X_test = test_df[feature_cols].to_numpy(copy=False)
+    y_test = test_df[target_col].to_numpy(copy=False)
 
-    model = RandomForestRegressor(**rf_params)
-    model.fit(X, y)
-    return model, feature_cols, train_df
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
 
+    out = test_df[[date_col, id_col]].copy()
+    out.rename(columns={id_col: "station"}, inplace=True)
+    out["y_true"] = y_test
+    out["y_pred"] = y_pred
+    out = out.sort_values(date_col).reset_index(drop=True)
 
-def predict_on_grid_daily(
-    grid_df: pd.DataFrame,
-    *,
-    dates: Union[pd.DatetimeIndex, Iterable[pd.Timestamp], Tuple[str, str]],
-    model: RandomForestRegressor,
-    feature_cols: List[str],
-    add_cyclic: bool = True,
-    cell_id_col: str = "cell_id",
-    date_col: str = "date",
-    lat_col: str = "latitude",
-    lon_col: str = "longitude",
-    alt_col: str = "altitude",
-    out_value_col: str = "y_pred",
-    chunk_size: int = 200_000
-) -> pd.DataFrame:
-    """
-    Predict a *daily* time series on a spatial grid for the given `dates`.
+    daily = _safe_metrics(out["y_true"], out["y_pred"])
+    monthly, _ = aggregate_and_score(out, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg=agg_for_metrics)
+    annual, _ = aggregate_and_score(out, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg=agg_for_metrics)
+    metrics = {"daily": daily, "monthly": monthly, "annual": annual}
 
-    Parameters
-    ----------
-    grid_df : DataFrame
-        Grid with at least [latitude, longitude, altitude] and optional cell_id.
-    dates : sequence of timestamps *or* (start, end) tuple/strings.
-    model : trained RandomForest (global) and its `feature_cols`.
-
-    Notes
-    -----
-    - Generates a cartesian product of grid cells × days, **streamed** in chunks.
-    - If `cell_id_col` does not exist, an integer id is assigned (0..N-1).
-    """
-    gd = grid_df.copy()
-    if cell_id_col not in gd.columns:
-        gd[cell_id_col] = np.arange(len(gd), dtype=int)
-
-    if isinstance(dates, tuple) and len(dates) == 2:
-        start, end = pd.to_datetime(dates[0]), pd.to_datetime(dates[1])
-        dt_index = pd.date_range(start=start, end=end, freq="D")
-    else:
-        dt_index = pd.DatetimeIndex(pd.to_datetime(list(dates)))
-
-    # Prepare static feature block from grid
-    static_cols = [lat_col, lon_col, alt_col]
-    missing = [c for c in static_cols if c not in gd.columns]
-    if missing:
-        raise ValueError(f"Grid is missing required columns: {missing}")
-
-    # Create an iterator over chunks of days to keep memory bounded
-    results = []
-    for i in range(0, len(dt_index), max(1, chunk_size // max(1, len(gd)))):
-        days = dt_index[i:i + max(1, chunk_size // max(1, len(gd)))]
-        block = (
-            gd[[cell_id_col] + static_cols]
-            .assign(**{date_col: days.min()})
-            .iloc[np.repeat(np.arange(len(gd)), len(days))]
-            .reset_index(drop=True)
-        )
-        # expand dates across rows
-        block[date_col] = np.tile(days.values, len(gd))
-        block = add_time_features(block, date_col, add_cyclic=add_cyclic)
-
-        X = block[feature_cols].to_numpy(copy=False)
-        yhat = model.predict(X)
-        block[out_value_col] = yhat
-        results.append(block[[cell_id_col, date_col, out_value_col]])
-
-    out = pd.concat(results, axis=0, ignore_index=True)
-    return out
+    _save_df(out, save_predictions_path, parquet_compression=parquet_compression)
+    _save_json(metrics, save_metrics_path)
+    return out, metrics, model, feature_cols
 
 
 # ---------------------------------------------------------------------
-# Orchestrating LOSO-FAST + maps
+# Full series LOSO
 # ---------------------------------------------------------------------
-def run_loso_fast_with_maps(
+def loso_predict_full_series(
     data: pd.DataFrame,
+    station_id: int,
     *,
-    # core columns
     id_col: str = "station",
     date_col: str = "date",
     lat_col: str = "latitude",
     lon_col: str = "longitude",
     alt_col: str = "altitude",
-    # target and optional covariates
     target_col: str = "prec",
-    var_cols: Optional[Iterable[str]] = None,
-    # selection
-    station_ids: Optional[Iterable[int]] = None,
-    prefix: Optional[Iterable[str] | str] = None,
-    regex: Optional[str] = None,
-    custom_filter=None,
-    # time
     start: str = "1961-01-01",
     end: str = "2023-12-31",
-    # model + features
-    rf_params: Dict = dict(n_estimators=200, random_state=42, n_jobs=-1),
+    rf_params: Dict = dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1),
     add_cyclic: bool = False,
     feature_cols: Optional[List[str]] = None,
-    # neighbors
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_series_path: Optional[str] = None,
+    save_metrics_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+    df = ensure_datetime(data, date_col)
+
+    st = df[df[id_col] == station_id]
+    if st.empty:
+        raise ValueError(f"No rows for station {station_id}.")
+    lat0 = st[lat_col].median()
+    lon0 = st[lon_col].median()
+    alt0 = st[alt_col].median()
+
+    train_df = add_time_features(df.copy(), date_col, add_cyclic=add_cyclic)
+
+    if feature_cols is None:
+        feature_cols = [lat_col, lon_col, alt_col, "year", "month", "doy"]
+        if add_cyclic:
+            feature_cols += ["doy_sin", "doy_cos"]
+
+    train_rest = train_df[train_df[id_col] != station_id]
+    sample_t = sample_target_for_training(
+        train_df,
+        id_col=id_col,
+        date_col=date_col,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        station_id=station_id,
+        include_target_pct=include_target_pct,
+        random_state=include_target_seed,
+    )
+    train_df = pd.concat([train_rest, sample_t], axis=0, copy=False).dropna(subset=feature_cols + [target_col])
+    if train_df.empty:
+        raise ValueError("Training set is empty after filtering.")
+
+    model = RandomForestRegressor(**rf_params)
+    model.fit(train_df[feature_cols], train_df[target_col])
+
+    dates = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq="D")
+    synth = pd.DataFrame({date_col: dates, "station": station_id, lat_col: lat0, lon_col: lon0, alt_col: alt0})
+    synth = add_time_features(synth, date_col, add_cyclic=add_cyclic)
+
+    y_pred_full = model.predict(synth[feature_cols])
+    full_df = synth[[date_col, "station"]].copy()
+    full_df["y_pred_full"] = y_pred_full
+
+    obs = df[df[id_col] == station_id][[date_col, target_col]].rename(columns={target_col: "y_true"})
+    full_df = full_df.merge(obs, on=date_col, how="left")
+
+    comp = full_df.dropna(subset=["y_true"]).copy()
+    comp["y_pred"] = comp["y_pred_full"]
+    daily = _safe_metrics(comp["y_true"], comp["y_pred"])
+    monthly, _ = aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg="sum")
+    annual, _ = aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg="sum")
+    metrics = {"daily": daily, "monthly": monthly, "annual": annual}
+
+    _save_df(full_df, save_series_path, parquet_compression=parquet_compression)
+    _save_json(metrics, save_metrics_path)
+    return full_df, metrics, model, feature_cols
+
+
+# ---------------------------------------------------------------------
+# EVALUATION — Classic
+# ---------------------------------------------------------------------
+def evaluate_all_stations(
+    data: pd.DataFrame,
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    rf_params: Dict = dict(n_estimators=300, max_depth=30, random_state=42, n_jobs=-1),
+    agg_for_metrics: str = "sum",
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    order_by: Tuple[str, bool] = ("RMSE_d", True),
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_table_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> pd.DataFrame:
+    results = []
+    stations = data[id_col].dropna().unique()
+
+    for stid in stations:
+        try:
+            out_df, metrics, _m, _f = loso_train_predict_station(
+                data,
+                station_id=int(stid),
+                id_col=id_col,
+                date_col=date_col,
+                lat_col=lat_col,
+                lon_col=lon_col,
+                alt_col=alt_col,
+                target_col=target_col,
+                rf_params=rf_params,
+                agg_for_metrics=agg_for_metrics,
+                start=start,
+                end=end,
+                add_cyclic=add_cyclic,
+                feature_cols=feature_cols,
+                include_target_pct=include_target_pct,
+                include_target_seed=include_target_seed,
+            )
+            results.append(
+                {
+                    "station": int(stid),
+                    "n_rows": len(out_df),
+                    "MAE_d": metrics["daily"]["MAE"],
+                    "RMSE_d": metrics["daily"]["RMSE"],
+                    "R2_d": metrics["daily"]["R2"],
+                    "MAE_m": metrics["monthly"]["MAE"],
+                    "RMSE_m": metrics["monthly"]["RMSE"],
+                    "R2_m": metrics["monthly"]["R2"],
+                    "MAE_y": metrics["annual"]["MAE"],
+                    "RMSE_y": metrics["annual"]["RMSE"],
+                    "R2_y": metrics["annual"]["R2"],
+                }
+            )
+        except Exception:
+            results.append(
+                {
+                    "station": int(stid),
+                    "n_rows": 0,
+                    "MAE_d": np.nan,
+                    "RMSE_d": np.nan,
+                    "R2_d": np.nan,
+                    "MAE_m": np.nan,
+                    "RMSE_m": np.nan,
+                    "R2_m": np.nan,
+                    "MAE_y": np.nan,
+                    "RMSE_y": np.nan,
+                    "R2_y": np.nan,
+                }
+            )
+
+    df_out = pd.DataFrame(results)
+    if order_by and not df_out.empty:
+        col, asc = order_by
+        if col in df_out.columns:
+            df_out = df_out.sort_values(col, ascending=asc).reset_index(drop=True)
+
+    _save_df(df_out, save_table_path, parquet_compression=parquet_compression)
+    return df_out
+
+
+# ---------------------------------------------------------------------
+# EVALUATION — FAST (single pre-processing, optional neighbors, buffered logging)
+# ---------------------------------------------------------------------
+def _append_rows_to_csv(rows: List[Dict], path: str, *, header_written_flag: Dict[str, bool]) -> None:
+    if not rows or path is None:
+        return
+    df_tmp = pd.DataFrame(rows)
+    first = not os.path.exists(path) and not header_written_flag.get(path, False)
+    df_tmp.to_csv(path, mode="a", index=False, header=first)
+    header_written_flag[path] = True
+
+
+def _preprocess_for_loso_fast(
+    data: pd.DataFrame,
+    *,
+    id_col: str,
+    date_col: str,
+    add_cyclic: bool,
+    lat_col: str,
+    lon_col: str,
+    alt_col: str,
+    var_cols: Optional[Iterable[str]],
+    target_col: str,
+    start: Optional[str],
+    end: Optional[str],
+    feature_cols: Optional[List[str]],
+) -> Tuple[pd.DataFrame, List[str]]:
+    df = data.copy()
+
+    # datetime
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(df[date_col]):
+        df[date_col] = df[date_col].dt.tz_localize(None)
+    df = df.dropna(subset=[date_col])
+
+    # clip
+    if start or end:
+        lo = pd.to_datetime(start) if start else df[date_col].min()
+        hi = pd.to_datetime(end) if end else df[date_col].max()
+        df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
+
+    # time features
+    df["year"] = df[date_col].dt.year
+    df["month"] = df[date_col].dt.month
+    df["doy"] = df[date_col].dt.dayofyear
+    if add_cyclic:
+        df["doy_sin"] = np.sin(2 * np.pi * df["doy"] / 365.25)
+        df["doy_cos"] = np.cos(2 * np.pi * df["doy"] / 365.25)
+
+    # optional covariates
+    resolved_vars = _resolve_columns(df, var_cols)
+
+    # features
+    if feature_cols is None:
+        feats = [lat_col, lon_col, alt_col, "year", "month", "doy"]
+        if add_cyclic:
+            feats += ["doy_sin", "doy_cos"]
+        feats += resolved_vars
+    else:
+        feats = list(feature_cols)
+
+    keep = sorted(set([id_col, date_col, lat_col, lon_col, alt_col, target_col] + feats))
+    df = df[keep]
+    return df, feats
+
+
+def evaluate_all_stations_fast(
+    data: pd.DataFrame,
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    var_col: Optional[str] = None,                 # alias string
+    var_cols: Optional[Iterable[str]] = None,      # list of covariates
+    target_col: str = "prec",
+    prefix: Optional[Iterable[str]] = None,
+    station_ids: Optional[Iterable[int]] = None,
+    regex: Optional[str] = None,
+    custom_filter: Optional[Callable[[int], bool]] = None,
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    rf_params: Dict = dict(n_estimators=100, max_depth=None, random_state=42, n_jobs=-1),
+    agg_for_metrics: str = "sum",
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
     k_neighbors: Optional[int] = None,
     neighbor_map: Optional[Dict[int, List[int]]] = None,
-    # leakage and station filter
+    log_csv: Optional[str] = None,
+    flush_every: int = 20,
+    show_progress: bool = True,
     include_target_pct: float = 0.0,
     include_target_seed: int = 42,
     min_station_rows: Optional[int] = None,
-    # I/O
-    out_dir: str = "/kaggle/working/loso",
-    table_filename: str = "loso_metrics.parquet",
-    make_static_map: bool = True,
-    make_interactive_map: bool = True,
-) -> Dict[str, Optional[str]]:
-    """
-    Run LOSO-FAST over the dataset and (optionally) produce metric maps.
+    save_table_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> pd.DataFrame:
+    if var_cols is None and var_col is not None:
+        var_cols = [var_col]
 
-    Returns
-    -------
-    dict with keys: {"metrics_path", "static_map_path", "interactive_map_path"}
-    """
-    ensure_dir(out_dir)
-    metrics_path = os.path.join(out_dir, table_filename)
+    t_all0 = time.time()
 
-    df_metrics = evaluate_all_stations_fast(
+    # one pre-processing pass
+    df, feats = _preprocess_for_loso_fast(
         data,
-        id_col=id_col, date_col=date_col, lat_col=lat_col, lon_col=lon_col, alt_col=alt_col,
-        var_cols=var_cols, target_col=target_col,
-        prefix=prefix, station_ids=station_ids, regex=regex, custom_filter=custom_filter,
-        start=start, end=end, rf_params=rf_params, agg_for_metrics="sum",
-        add_cyclic=add_cyclic, feature_cols=feature_cols,
-        k_neighbors=k_neighbors, neighbor_map=neighbor_map,
-        show_progress=True, include_target_pct=include_target_pct, include_target_seed=include_target_seed,
-        min_station_rows=min_station_rows,
-        save_table_path=metrics_path
+        id_col=id_col,
+        date_col=date_col,
+        add_cyclic=add_cyclic,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        alt_col=alt_col,
+        var_cols=var_cols,
+        target_col=target_col,
+        start=start,
+        end=end,
+        feature_cols=feature_cols,
     )
 
-    # Maps (optional dependencies)
-    static_map_path = None
-    interactive_map_path = None
+    # valid mask
+    valid_mask_global = ~df[feats + [target_col]].isna().any(axis=1)
 
-    if make_static_map:
-        try:
-            from .maps import metric_bubble_map_static  # provided below, same file
-            static_map_path = os.path.join(out_dir, "metric_map_static.png")
-            metric_bubble_map_static(
-                df_metrics, data,
-                metric_col="R2_d",
-                id_col_res="station", id_col_data=id_col,
-                lat_col=lat_col, lon_col=lon_col,
-                title="Daily R² (LOSO)",
-                save_to=static_map_path
-            )
-        except Exception as e:
-            print(f"[WARN] Static map generation skipped: {e}")
+    # station selection
+    stations = select_stations(df, id_col=id_col, prefix=prefix, station_ids=station_ids, regex=regex, custom_filter=custom_filter)
 
-    if make_interactive_map:
-        try:
-            from .maps import metric_bubble_map_interactive  # provided below, same file
-            interactive_map_path = os.path.join(out_dir, "metric_map_interactive.html")
-            metric_bubble_map_interactive(
-                df_metrics, data,
-                metric_col="R2_d",
-                id_col_res="station", id_col_data=id_col,
-                lat_col=lat_col, lon_col=lon_col,
-                save_to=interactive_map_path
-            )
-        except Exception as e:
-            print(f"[WARN] Interactive map generation skipped: {e}")
+    # optional filter by min valid rows per station
+    if min_station_rows is not None:
+        valid_counts = df.loc[valid_mask_global, [id_col]].groupby(id_col).size().astype(int)
+        before = len(stations)
+        stations = [s for s in stations if int(valid_counts.get(s, 0)) >= int(min_station_rows)]
+        if show_progress:
+            tqdm.write(f"Filtered by min_station_rows={min_station_rows}: {before} → {len(stations)} stations")
 
-    return {
-        "metrics_path": metrics_path,
-        "static_map_path": static_map_path,
-        "interactive_map_path": interactive_map_path
-    }
+    # neighbors
+    if k_neighbors is not None and neighbor_map is None:
+        neighbor_map = build_station_kneighbors(df, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors)
+
+    header_flag = {}
+    rows: List[Dict] = []
+    pending: List[Dict] = []
+    iterator = tqdm(stations, desc="Evaluating stations", unit="st") if show_progress else stations
+
+    for sid in iterator:
+        t0 = time.time()
+
+        is_target = (df[id_col] == sid)
+        st_block = df.loc[is_target, [lat_col, lon_col, alt_col]]
+        lat_med = float(st_block[lat_col].median()) if not st_block.empty else np.nan
+        lon_med = float(st_block[lon_col].median()) if not st_block.empty else np.nan
+        alt_med = float(st_block[alt_col].median()) if not st_block.empty else np.nan
+
+        # train pool (neighbors optional)
+        if k_neighbors is not None:
+            neigh = neighbor_map.get(sid, [])
+            is_train_pool = df[id_col].isin(neigh) & (~is_target)
+        else:
+            is_train_pool = ~is_target
+
+        test_mask = is_target & valid_mask_global
+        test_df = df.loc[test_mask]
+        if test_df.empty:
+            sec = time.time() - t0
+            row = {
+                "station": sid,
+                "n_rows": 0,
+                "seconds": sec,
+                "MAE_d": np.nan,
+                "RMSE_d": np.nan,
+                "R2_d": np.nan,
+                "MAE_m": np.nan,
+                "RMSE_m": np.nan,
+                "R2_m": np.nan,
+                "MAE_y": np.nan,
+                "RMSE_y": np.nan,
+                "R2_y": np.nan,
+                "include_target_pct": float(include_target_pct),
+                lat_col: lat_med,
+                lon_col: lon_med,
+                alt_col: alt_med,
+            }
+            rows.append(row)
+            pending.append(row)
+            if log_csv and len(pending) >= flush_every:
+                _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
+                pending = []
+            if show_progress:
+                tqdm.write(f"Station {sid}: 0 valid rows (skipped)")
+            continue
+
+        train_pool = df.loc[is_train_pool & valid_mask_global]
+
+        # optional inclusion of target rows in training
+        pct = max(0.0, min(float(include_target_pct), 100.0))
+        if pct > 0.0:
+            n_take = int(np.ceil(len(test_df) * (pct / 100.0)))
+            idx_sample = test_df.sample(n=n_take, random_state=include_target_seed).index
+            train_df = pd.concat([train_pool, df.loc[idx_sample]], axis=0, copy=False)
+        else:
+            train_df = train_pool
+
+        if train_df.empty:
+            sec = time.time() - t0
+            row = {
+                "station": sid,
+                "n_rows": 0,
+                "seconds": sec,
+                "MAE_d": np.nan,
+                "RMSE_d": np.nan,
+                "R2_d": np.nan,
+                "MAE_m": np.nan,
+                "RMSE_m": np.nan,
+                "R2_m": np.nan,
+                "MAE_y": np.nan,
+                "RMSE_y": np.nan,
+                "R2_y": np.nan,
+                "include_target_pct": float(include_target_pct),
+                lat_col: lat_med,
+                lon_col: lon_med,
+                alt_col: alt_med,
+            }
+            rows.append(row)
+            pending.append(row)
+            if log_csv and len(pending) >= flush_every:
+                _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
+                pending = []
+            if show_progress:
+                tqdm.write(f"Station {sid}: empty train (skipped)")
+            continue
+
+        # fit & predict
+        X_train = train_df[feats].to_numpy(copy=False)
+        y_train = train_df[target_col].to_numpy(copy=False)
+        X_test = test_df[feats].to_numpy(copy=False)
+        y_test = test_df[target_col].to_numpy(copy=False)
+
+        model = RandomForestRegressor(**rf_params)
+        model.fit(X_train, y_train)
+        y_hat = model.predict(X_test)
+
+        df_pred = pd.DataFrame({date_col: test_df[date_col].values, "y_true": y_test, "y_pred": y_hat})
+        daily = _safe_metrics(df_pred["y_true"], df_pred["y_pred"])
+        monthly, _ = aggregate_and_score(df_pred, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg=agg_for_metrics)
+        annual, _ = aggregate_and_score(df_pred, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg=agg_for_metrics)
+
+        sec = time.time() - t0
+        row = {
+            "station": sid,
+            "n_rows": int(len(df_pred)),
+            "seconds": sec,
+            "MAE_d": daily["MAE"],
+            "RMSE_d": daily["RMSE"],
+            "R2_d": daily["R2"],
+            "MAE_m": monthly["MAE"],
+            "RMSE_m": monthly["RMSE"],
+            "R2_m": monthly["R2"],
+            "MAE_y": annual["MAE"],
+            "RMSE_y": annual["RMSE"],
+            "R2_y": annual["R2"],
+            "include_target_pct": float(include_target_pct),
+            lat_col: lat_med,
+            lon_col: lon_med,
+            alt_col: alt_med,
+        }
+        rows.append(row)
+        pending.append(row)
+
+        if log_csv and len(pending) >= flush_every:
+            _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
+            pending = []
+
+        if show_progress:
+            tqdm.write(f"Station {sid}: {sec:.2f}s  (train={len(train_df):,}  test={len(test_df):,}  incl={pct:.1f}%)")
+
+    if log_csv and pending:
+        _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
+
+    result_df = pd.DataFrame(rows)
+    _save_df(result_df, save_table_path, parquet_compression=parquet_compression)
+
+    if show_progress:
+        total_sec = time.time() - t_all0
+        tqdm.write(
+            f"Done. {len(stations)} stations in {total_sec:.1f}s "
+            f"(avg {total_sec / max(1, len(stations)):.2f}s/station)."
+        )
+    return result_df
 
 
 # ---------------------------------------------------------------------
-# Lightweight maps (kept here to avoid hard dependency in `loso.py`)
+# EXPORT — per-station + batch
 # ---------------------------------------------------------------------
-def _coords_unique(data: pd.DataFrame, id_col="station", lat_col="latitude", lon_col="longitude") -> pd.DataFrame:
-    """Unique coordinates per station (median per id)."""
-    return (
-        data.dropna(subset=[lat_col, lon_col])
-            .groupby(id_col)[[lat_col, lon_col]].median().reset_index()
-            .rename(columns={id_col: "station"})
+def export_full_series_station(
+    data: pd.DataFrame,
+    station_id: int,
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    train_start: Optional[str] = None,
+    train_end: Optional[str] = None,
+    rf_params: Dict = dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1),
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    k_neighbors: Optional[int] = None,
+    neighbor_map: Optional[Dict[int, List[int]]] = None,
+    out_dir: str = "/kaggle/working/series",
+    file_format: str = "parquet",
+    parquet_compression: str = "snappy",
+    csv_index: bool = False,
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_metrics_path: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], str]:
+    df = data.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+
+    if k_neighbors is not None:
+        if neighbor_map is None:
+            neighbor_map = build_station_kneighbors(df, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors)
+        neigh_ids = neighbor_map.get(station_id, [])
+        df_train = df[df[id_col].isin(neigh_ids)]
+        df_target = df[df[id_col] == station_id]
+        df_local = pd.concat([df_train, df_target], axis=0, copy=False)
+    else:
+        df_local = df
+
+    if train_start or train_end:
+        lo = pd.to_datetime(train_start) if train_start else df_local[date_col].min()
+        hi = pd.to_datetime(train_end) if train_end else df_local[date_col].max()
+        df_local = df_local[(df_local[date_col] >= lo) & (df_local[date_col] <= hi)]
+
+    full_df, metrics, _model, _feats = loso_predict_full_series(
+        df_local,
+        station_id,
+        id_col=id_col,
+        date_col=date_col,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        alt_col=alt_col,
+        target_col=target_col,
+        start=start,
+        end=end,
+        rf_params=rf_params,
+        add_cyclic=add_cyclic,
+        feature_cols=feature_cols,
+        include_target_pct=include_target_pct,
+        include_target_seed=include_target_seed,
     )
 
+    os.makedirs(out_dir, exist_ok=True)
+    base = f"loso_fullseries_{station_id}_{start.replace('-','')}_{end.replace('-','')}"
+    if file_format.lower() == "parquet":
+        out_path = os.path.join(out_dir, base + ".parquet")
+        full_df.to_parquet(out_path, index=False, compression=parquet_compression)
+    elif file_format.lower() == "csv":
+        out_path = os.path.join(out_dir, base + ".csv")
+        full_df.to_csv(out_path, index=csv_index)
+    else:
+        raise ValueError("file_format must be 'parquet' or 'csv'.")
 
-def metric_bubble_map_static(
-    df_result: pd.DataFrame,
+    _save_json(metrics, save_metrics_path)
+    return full_df, metrics, out_path
+
+
+def export_full_series_batch(
     data: pd.DataFrame,
     *,
-    metric_col: str = "R2_d",
-    title: str = "Metric by Station",
-    world_region: Optional[str] = "Mexico",
-    use_diverging: Optional[bool] = None,
-    cmap_div: str = "RdBu_r",
-    cmap_seq: str = "Blues",
-    size_by_n: bool = True,
-    size_min: float = 30, size_max: float = 300,
-    edgecolor: str = "white", edgewidth: float = 0.8,
-    alpha: float = 0.9,
-    figsize: Tuple[int, int] = (9, 9),
+    station_ids: Optional[Iterable[int]] = None,
+    prefix: Optional[Iterable[str] | str] = None,
+    regex: Optional[str] = None,
+    custom_filter: Optional[Callable[[int], bool]] = None,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    train_start: Optional[str] = None,
+    train_end: Optional[str] = None,
+    rf_params: Dict = dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1),
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    k_neighbors: Optional[int] = None,
+    neighbor_map: Optional[Dict[int, List[int]]] = None,
+    out_dir: str = "/kaggle/working/series",
+    file_format: str = "parquet",
+    parquet_compression: str = "snappy",
+    csv_index: bool = False,
+    manifest_path: Optional[str] = "/kaggle/working/series_manifest.csv",
+    show_progress: bool = True,
+    min_overlap_corr: int = 60,
+    combine_output_path: Optional[str] = None,
+    combine_format: str = "csv",
+    combine_parquet_compression: str = "snappy",
+    combine_schema: str = "input_like",
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+) -> pd.DataFrame:
+    stations = select_stations(data, id_col=id_col, prefix=prefix, station_ids=station_ids, regex=regex, custom_filter=custom_filter)
+
+    if k_neighbors is not None and neighbor_map is None:
+        neighbor_map = build_station_kneighbors(data, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors)
+
+    header_written = False
+    combine_parts: List[pd.DataFrame] = []
+    if combine_output_path is not None:
+        os.makedirs(os.path.dirname(combine_output_path), exist_ok=True)
+        if combine_format.lower() == "csv" and os.path.exists(combine_output_path):
+            os.remove(combine_output_path)
+
+    rows = []
+    it = tqdm(stations, desc="Exporting full series", unit="st") if show_progress else stations
+
+    for sid in it:
+        t0 = time.time()
+        try:
+            if k_neighbors is not None:
+                neigh_ids = neighbor_map.get(sid, [])
+                df_train = data[data[id_col].isin(neigh_ids)]
+                df_test = data[data[id_col] == sid]
+                df_local = pd.concat([df_train, df_test], axis=0, copy=False)
+            else:
+                df_local = data
+
+            full_df, metrics, _model, _feats = loso_predict_full_series(
+                df_local,
+                sid,
+                id_col=id_col,
+                date_col=date_col,
+                lat_col=lat_col,
+                lon_col=lon_col,
+                alt_col=alt_col,
+                target_col=target_col,
+                start=start,
+                end=end,
+                rf_params=rf_params,
+                add_cyclic=add_cyclic,
+                feature_cols=feature_cols,
+                include_target_pct=include_target_pct,
+                include_target_seed=include_target_seed,
+            )
+
+            os.makedirs(out_dir, exist_ok=True)
+            base = f"loso_fullseries_{sid}_{start.replace('-','')}_{end.replace('-','')}"
+            if file_format.lower() == "parquet":
+                path = os.path.join(out_dir, base + ".parquet")
+                full_df.to_parquet(path, index=False, compression=parquet_compression)
+            elif file_format.lower() == "csv":
+                path = os.path.join(out_dir, base + ".csv")
+                full_df.to_csv(path, index=csv_index)
+            else:
+                raise ValueError("file_format must be 'parquet' or 'csv'.")
+
+            # Optional combined output
+            if combine_output_path is not None:
+                if combine_schema == "input_like":
+                    part = pd.DataFrame(
+                        {
+                            id_col: sid,
+                            lat_col: full_df[lat_col].median() if lat_col in full_df else np.nan,
+                            lon_col: full_df[lon_col].median() if lon_col in full_df else np.nan,
+                            alt_col: full_df[alt_col].median() if alt_col in full_df else np.nan,
+                            date_col: full_df[date_col].values,
+                        }
+                    )
+                    filled = full_df["y_true"].where(full_df["y_true"].notna(), full_df["y_pred_full"])
+                    part[target_col] = filled.values
+                    part = part[[id_col, lat_col, lon_col, alt_col, date_col, target_col]]
+                elif combine_schema == "compact":
+                    part = full_df[[date_col, "station", "y_pred_full", "y_true"]].copy()
+                    part[target_col] = part["y_true"].where(part["y_true"].notna(), part["y_pred_full"])
+                    part = part[["station", "y_pred_full", "y_true", date_col, target_col]]
+                else:
+                    raise ValueError("combine_schema must be 'input_like' or 'compact'.")
+
+                if combine_format.lower() == "csv":
+                    part.to_csv(combine_output_path, mode="a", index=False, header=(not header_written))
+                    header_written = True
+                elif combine_format.lower() == "parquet":
+                    combine_parts.append(part)
+                else:
+                    raise ValueError("combine_format must be 'csv' or 'parquet'.")
+
+            sec = time.time() - t0
+            cov = float(full_df["y_true"].notna().mean()) * 100.0
+            rows.append(
+                {
+                    "station": sid,
+                    "path": path,
+                    "seconds": sec,
+                    "coverage_pct": cov,
+                    "MAE_d": metrics["daily"]["MAE"],
+                    "RMSE_d": metrics["daily"]["RMSE"],
+                    "R2_d": metrics["daily"]["R2"],
+                    "MAE_m": metrics["monthly"]["MAE"],
+                    "RMSE_m": metrics["monthly"]["RMSE"],
+                    "R2_m": metrics["monthly"]["R2"],
+                    "MAE_y": metrics["annual"]["MAE"],
+                    "RMSE_y": metrics["annual"]["RMSE"],
+                    "R2_y": metrics["annual"]["R2"],
+                }
+            )
+        except Exception as e:
+            sec = time.time() - t0
+            rows.append(
+                {
+                    "station": sid,
+                    "path": None,
+                    "seconds": sec,
+                    "coverage_pct": np.nan,
+                    "MAE_d": np.nan,
+                    "RMSE_d": np.nan,
+                    "R2_d": np.nan,
+                    "MAE_m": np.nan,
+                    "RMSE_m": np.nan,
+                    "R2_m": np.nan,
+                    "MAE_y": np.nan,
+                    "RMSE_y": np.nan,
+                    "R2_y": np.nan,
+                    "error": str(e),
+                }
+            )
+
+    if combine_output_path is not None and combine_format.lower() == "parquet" and len(combine_parts) > 0:
+        big = pd.concat(combine_parts, axis=0, ignore_index=True)
+        big.to_parquet(combine_output_path, index=False, compression=combine_parquet_compression)
+
+    manifest = pd.DataFrame(rows)
+    if manifest_path:
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        manifest.to_csv(manifest_path, index=False)
+    return manifest
+
+
+# ---------------------------------------------------------------------
+# Plot helper — OBS vs RF vs external (e.g., NASA)
+# ---------------------------------------------------------------------
+def plot_compare_obs_rf_nasa(
+    data: pd.DataFrame,
+    *,
+    station_id: int,
+    id_col: str = "station",
+    date_col: str = "date",
+    obs_col: Optional[str] = "tmax",
+    nasa_col: Optional[str] = None,
+    rf_df: Optional[pd.DataFrame] = None,
+    rf_date_col: str = "date",
+    rf_value_col: Optional[str] = "y_pred_full",
+    rf_label: Optional[str] = "RF",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    resample: Optional[str] = "D",
+    agg: Optional[str] = "mean",
+    smooth: Optional[int] = None,
+    figsize: Optional[Tuple[int, int]] = (12, 5),
+    title: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    legend_loc: Optional[str] = "best",
+    grid: Optional[bool] = True,
+    xlim: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    date_fmt: Optional[str] = None,
     save_to: Optional[str] = None,
-    id_col_res: str = "station",
-    id_col_data: str = "station",
-    lat_col: str = "latitude", lon_col: str = "longitude",
-):
-    """
-    Static bubble map (matplotlib + geopandas) for a metric column on station results.
-    """
-    import matplotlib.pyplot as plt
-    import geopandas as gpd
-    import numpy as np
+    obs_style: Optional[Dict] = None,
+    nasa_style: Optional[Dict] = None,
+    rf_style: Optional[Dict] = None,
+) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
+    def _ensure_dt(s: pd.Series) -> pd.Series:
+        if not np.issubdtype(s.dtype, np.datetime64):
+            s = pd.to_datetime(s, errors="coerce")
+        if pd.api.types.is_datetime64tz_dtype(s):
+            s = s.dt.tz_localize(None)
+        return s
 
-    if metric_col not in df_result.columns:
-        raise ValueError(f"'{metric_col}' not found in df_result.")
+    def _clip_period(df: pd.DataFrame, cdate: str) -> pd.DataFrame:
+        out = df.copy()
+        out[cdate] = _ensure_dt(out[cdate])
+        if start or end:
+            lo = pd.to_datetime(start) if start else out[cdate].min()
+            hi = pd.to_datetime(end) if end else out[cdate].max()
+            out = out[(out[cdate] >= lo) & (out[cdate] <= hi)]
+        return out
 
-    coords = _coords_unique(data, id_col=id_col_data, lat_col=lat_col, lon_col=lon_col)
-    cols_to_merge = [id_col_res, metric_col] + (["n_rows"] if "n_rows" in df_result.columns else [])
-    metrics = df_result[cols_to_merge].rename(columns={id_col_res: "station"})
-    gdf = coords.merge(metrics, on="station", how="left").dropna(subset=[metric_col])
-    if gdf.empty:
-        raise ValueError("No stations with the requested metric.")
+    def _prep_series(s: pd.Series) -> pd.Series:
+        out = s.copy().sort_index()
+        if resample is not None:
+            op = (agg or "mean").lower()
+            if op == "sum":
+                out = out.resample(resample).sum()
+            elif op == "median":
+                out = out.resample(resample).median()
+            else:
+                out = out.resample(resample).mean()
+        if smooth and isinstance(smooth, int) and smooth > 1:
+            out = out.rolling(smooth, min_periods=1, center=True).mean()
+        return out
 
-    gdf = gpd.GeoDataFrame(gdf, geometry=gpd.points_from_xy(gdf[lon_col], gdf[lat_col]), crs="EPSG:4326")
-    world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
-    base = world if world_region is None else world[world.name == world_region]
-    if base.empty: base = world
+    base = data.copy()
+    if id_col in base.columns:
+        base = base[base[id_col] == station_id]
+    if base.empty:
+        raise ValueError(f"No data for station {station_id}.")
+    base = _clip_period(base, date_col)
 
-    v = gdf[metric_col].astype(float)
-    if use_diverging is None:
-        use_diverging = ("R2" in metric_col)
+    series = {}
+    labels = {}
+    metrics: Dict[str, Dict[str, float]] = {}
 
-    if use_diverging:
-        p5, p95 = np.nanpercentile(v, [5, 95])
-        vmax_abs = max(abs(p5), abs(p95), 1e-9)
-        vmin, vmax = -vmax_abs, vmax_abs
-        cmap = cmap_div
-    else:
-        p5, p95 = np.nanpercentile(v, [5, 95])
-        vmin = max(np.nanmin(v), p5); vmax = max(vmin + 1e-9, p95)
-        cmap = cmap_seq
+    if obs_col is not None and obs_col in base.columns:
+        obs = base[[date_col, obs_col]].dropna().rename(columns={obs_col: "obs"})
+        obs[date_col] = _ensure_dt(obs[date_col])
+        obs = obs.set_index(date_col).sort_index()
+        if not obs.empty:
+            series["obs"] = obs["obs"]
+            labels["obs"] = "Observed"
 
-    if size_by_n and "n_rows" in gdf.columns:
-        n = gdf["n_rows"].astype(float); n_min, n_max = n.min(), n.max()
-        sizes = np.full(len(gdf), (size_min + size_max) / 2) if n_min == n_max else size_min + (n - n_min) * (size_max - size_min) / (n_max - n_min)
-    else:
-        sizes = np.full(len(gdf), (size_min + size_max) / 2)
+    if nasa_col is not None and nasa_col in base.columns:
+        nasa = base[[date_col, nasa_col]].dropna().rename(columns={nasa_col: "nasa"})
+        nasa[date_col] = _ensure_dt(nasa[date_col])
+        nasa = nasa.set_index(date_col).sort_index()
+        if not nasa.empty:
+            series["nasa"] = nasa["nasa"]
+            labels["nasa"] = f"{nasa_col}"
 
-    fig, ax = plt.subplots(figsize=figsize)
-    base.plot(ax=ax, color="#F5F6F7", edgecolor="#D0D3D4", linewidth=0.8, zorder=0)
-    gdf.plot(
-        ax=ax, column=metric_col, cmap=cmap, markersize=sizes, alpha=alpha,
-        edgecolor=edgecolor, linewidth=edgewidth, vmin=vmin, vmax=vmax,
-        legend=True, legend_kwds={"label": metric_col, "shrink": 0.65}, zorder=2
-    )
-    ax.set_title(title, fontsize=16, pad=10)
-    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    xmin, ymin, xmax, ymax = gdf.total_bounds
-    pad_x, pad_y = (xmax - xmin) * 0.07, (ymax - ymin) * 0.07
-    ax.set_xlim(xmin - pad_x, xmax + pad_x); ax.set_ylim(ymin - pad_y, ymax + pad_y)
-    ax.set_aspect(1.0); ax.grid(ls=":", lw=0.6, color="#9E9E9E", alpha=0.35)
+    if rf_df is not None and rf_value_col is not None and rf_value_col in rf_df.columns:
+        rf = rf_df.copy()
+        rf[rf_date_col] = _ensure_dt(rf[rf_date_col])
+        rf = _clip_period(rf, rf_date_col)
+        rf = rf[[rf_date_col, rf_value_col]].dropna()
+        rf = rf.set_index(rf_date_col).sort_index()
+        if not rf.empty:
+            series["rf"] = rf[rf_value_col]
+            labels["rf"] = rf_label or "RF"
+
+    if len(series) == 0:
+        raise ValueError("Nothing to plot (all series are None or empty).")
+
+    if "obs" in series:
+        from numpy import nan
+
+        def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
+            pair = pd.concat([a, b], axis=1, join="inner").dropna()
+            if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
+                return dict(MAE=nan, RMSE=nan, R2=nan)
+            return {
+                "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
+                "RMSE": mean_squared_error(pair.iloc[:, 0], pair.iloc[:, 1], squared=False),
+                "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
+            }
+
+        if "nasa" in series:
+            metrics["nasa"] = _pair_metrics(series["obs"], series["nasa"])
+        if "rf" in series:
+            metrics["rf"] = _pair_metrics(series["obs"], series["rf"])
+
+    for k in list(series.keys()):
+        series[k] = _prep_series(series[k])
+
+    obs_style = dict({"marker": "o", "ms": 3, "alpha": 0.7, "color": "#37474F", "ls": ""}, **(obs_style or {}))
+    nasa_style = dict({"lw": 2.0, "alpha": 0.9, "color": "#B71C1C"}, **(nasa_style or {}))
+    rf_style = dict({"lw": 2.0, "alpha": 0.9, "color": "#1E88E5"}, **(rf_style or {}))
+
+    fig, ax = plt.subplots(figsize=figsize or (12, 5))
+
+    if "obs" in series:
+        ax.plot(series["obs"].index, series["obs"].values, label=labels["obs"], **obs_style)
+    if "nasa" in series:
+        lbl = labels["nasa"]
+        if "nasa" in metrics:
+            m = metrics["nasa"]
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+        ax.plot(series["nasa"].index, series["nasa"].values, label=lbl, **nasa_style)
+    if "rf" in series:
+        lbl = labels["rf"]
+        if "rf" in metrics:
+            m = metrics["rf"]
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+        ax.plot(series["rf"].index, series["rf"].values, label=lbl, **rf_style)
+
+    if title is None:
+        ylab = ylabel if ylabel is not None else (obs_col.upper() if obs_col else "Value")
+        title = f"Station {station_id} — {ylab}"
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+
+    if grid:
+        ax.grid(ls=":", alpha=0.5)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    if date_fmt is not None:
+        import matplotlib.dates as mdates
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
+
+    ax.legend(frameon=False, loc=legend_loc or "best")
 
     if save_to:
         fig.savefig(save_to, dpi=300, bbox_inches="tight")
-    return ax, gdf
+
+    return fig, ax, metrics
 
 
-def metric_bubble_map_interactive(
-    df_result: pd.DataFrame,
-    data: pd.DataFrame,
-    *,
-    metric_col: str = "R2_d",
-    save_to: str = "/kaggle/working/metric_map.html",
-    tiles: str = "CartoDB positron",
-    scale_radius_by_n: bool = True,
-    min_radius: float = 4, max_radius: float = 10,
-    id_col_res: str = "station", id_col_data: str = "station",
-    lat_col: str = "latitude", lon_col: str = "longitude",
-):
-    """
-    Interactive bubble map (folium) for a metric column on station results.
-    """
-    import folium
-    import branca.colormap as cm
-    import matplotlib
-    import numpy as np
-
-    if metric_col not in df_result.columns:
-        raise ValueError(f"'{metric_col}' not found in df_result.")
-
-    coords = _coords_unique(data, id_col=id_col_data, lat_col=lat_col, lon_col=lon_col)
-    cols_to_merge = [id_col_res, metric_col] + (["n_rows"] if "n_rows" in df_result.columns else [])
-    metrics = df_result[cols_to_merge].rename(columns={id_col_res: "station"})
-    dfm = coords.merge(metrics, on="station", how="left").dropna(subset=[metric_col])
-    if dfm.empty:
-        raise ValueError("No stations with the requested metric.")
-
-    center = [dfm[lat_col].median(), dfm[lon_col].median()]
-    m = folium.Map(location=center, zoom_start=6, tiles=tiles)
-
-    v = dfm[metric_col].astype(float)
-    if "R2" in metric_col:
-        p5, p95 = v.quantile([0.05, 0.95]).tolist()
-        vmax_abs = max(abs(p5), abs(p95), 1e-9)
-        vmin, vmax = -vmax_abs, vmax_abs
-        try:
-            colormap = cm.linear.RdBu_11.scale(vmin, vmax)
-        except AttributeError:
-            rd = matplotlib.cm.get_cmap('RdBu_r')
-            colors = [matplotlib.colors.rgb2hex(rd(x)) for x in np.linspace(0, 1, 256)]
-            colormap = cm.LinearColormap(colors, vmin=vmin, vmax=vmax)
-    else:
-        p5, p95 = v.quantile([0.05, 0.95]).tolist()
-        vmin = max(v.min(), p5); vmax = max(vmin + 1e-9, p95)
-        try:
-            colormap = cm.linear.Blues_09.scale(vmin, vmax)
-        except Exception:
-            blues = matplotlib.cm.get_cmap('Blues')
-            colors = [matplotlib.colors.rgb2hex(blues(x)) for x in np.linspace(0, 1, 256)]
-            colormap = cm.LinearColormap(colors, vmin=vmin, vmax=vmax)
-
-    colormap.caption = metric_col
-    colormap.add_to(m)
-
-    if scale_radius_by_n and "n_rows" in dfm.columns:
-        n = dfm["n_rows"].astype(float); n_min, n_max = n.min(), n.max()
-        radii = np.full(len(dfm), (min_radius + max_radius) / 2) if n_min == n_max else min_radius + (n - n_min) * (max_radius - min_radius) / (n_max - n_min)
-    else:
-        radii = np.full(len(dfm), (min_radius + max_radius) / 2)
-
-    for _, r in dfm.iterrows():
-        val = float(r[metric_col])
-        popup_html = f"<b>Station:</b> {int(r['station'])}<br><b>{metric_col}:</b> {val:.3f}"
-        if "n_rows" in dfm.columns:
-            popup_html += f"<br><b>n_rows:</b> {int(r['n_rows'])}"
-        folium.CircleMarker(
-            location=[r[lat_col], r[lon_col]],
-            radius=float(radii[0] if np.isscalar(radii) else r["station"] * 0 + radii[dfm.index.get_loc(r.name)]),
-            color=colormap(val), fill=True, fill_opacity=0.9, weight=0.8,
-            popup=folium.Popup(html=popup_html, max_width=260)
-        ).add_to(m)
-
-    if save_to:
-        m.save(save_to)
-    return m, dfm
+# ---------------------------------------------------------------------
+# Public symbols
+# ---------------------------------------------------------------------
+__all__ = [
+    # core & full series
+    "loso_train_predict_station",
+    "loso_predict_full_series",
+    # evaluation
+    "evaluate_all_stations",
+    "evaluate_all_stations_fast",
+    # export
+    "export_full_series_station",
+    "export_full_series_batch",
+    # helpers
+    "select_stations",
+    "build_station_kneighbors",
+    "neighbor_correlation_table",
+    "plot_compare_obs_rf_nasa",
+    # utility (intended)
+    "ensure_datetime",
+    "add_time_features",
+    "aggregate_and_score",
+    "set_warning_policy",
+]
 
