@@ -111,6 +111,38 @@ def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     return path
 
+# ---------------------------------------------------------------------
+# Resolve extra covariate columns (case-insensitive + aliases)
+# ---------------------------------------------------------------------
+def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
+    """
+    Return the subset of column names that exist in df, resolving:
+      - a single string or an iterable of strings
+      - case-insensitive matching
+      - common aliases (e.g., PRETOTCORR -> PRECTOTCORR)
+    Ignores None and non-existing names.
+    """
+    if cols is None:
+        return []
+    if isinstance(cols, str):
+        cols = [cols]
+
+    lower_map = {c.lower(): c for c in df.columns}
+    # common alias people often typo
+    aliases = {
+        "pretotcorr": "prectotcorr",   # NASA GPM corrected precip
+    }
+
+    resolved: List[str] = []
+    for raw in cols:
+        if raw is None:
+            continue
+        key = str(raw).lower()
+        key = aliases.get(key, key)
+        if key in lower_map:
+            resolved.append(lower_map[key])
+    return resolved
+
 
 # ---------------------------------------------------------------------
 # Generic utilities
