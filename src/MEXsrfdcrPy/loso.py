@@ -1304,3 +1304,122 @@ def plot_compare_obs_rf_nasa(
         fig.savefig(save_to, dpi=300, bbox_inches="tight")
 
     return fig, ax, metrics
+
+# =========================
+# FAST + % objetivo → serie completa
+# =========================
+def loso_predict_full_series_fast(
+    data: pd.DataFrame,
+    station_id: int,
+    *,
+    # columnas
+    id_col: str = "estacion",
+    date_col: str = "fecha",
+    lat_col: str = "latitud",
+    lon_col: str = "longitud",
+    alt_col: str = "altitud",
+    target_col: str = "precipitacion",
+    # periodo de la SERIE a entregar (predicha completa)
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    # (opcional) periodo para ENTRENAR
+    train_start: str | None = None,
+    train_end: str | None = None,
+    # modelo / features
+    rf_params: Dict = dict(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1),
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    # filtros “FAST”
+    prefix: Optional[Iterable[str] | str] = None,
+    station_ids: Optional[Iterable[int]] = None,
+    regex: Optional[str] = None,
+    custom_filter: Optional[Callable[[int], bool]] = None,
+    # aceleración por vecindad
+    k_neighbors: Optional[int] = None,
+    neighbor_map: Optional[Dict[int, List[int]]] = None,
+    # correlaciones
+    min_overlap_corr: int = 60,
+    # -------- NUEVO --------
+    include_target_pct: float = 0.0,        # 0 = LOSO; 100 = usa todo el objetivo en train
+    include_target_seed: int = 42,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str], Optional[pd.DataFrame]]:
+    """
+    FAST + % de la estación objetivo en entrenamiento.
+    Predice serie diaria COMPLETA en [start,end] (y_pred_full) y añade y_true donde exista.
+    """
+    df = data.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if start or end:
+        lo = pd.to_datetime(start) if start else df[date_col].min()
+        hi = pd.to_datetime(end) if end else df[date_col].max()
+        df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
+
+    selected = select_stations(
+        df, id_col=id_col, prefix=prefix, station_ids=station_ids, regex=regex, custom_filter=custom_filter
+    )
+    if selected:
+        df = df[df[id_col].isin(selected + [station_id])]
+
+    corr_tab = None
+    if k_neighbors is not None:
+        if neighbor_map is None:
+            neighbor_map = build_station_kneighbors(df, id_col=id_col, lat_col=lat_col, lon_col=lon_col, k=k_neighbors)
+        neigh_ids = neighbor_map.get(station_id, [])
+        df_train_pool = df[df[id_col].isin(neigh_ids)].copy()
+        df_target_all = df[df[id_col] == station_id].copy()
+        df_local = pd.concat([df_train_pool, df_target_all], axis=0, copy=False)
+        if len(neigh_ids) > 0:
+            corr_tab = neighbor_correlation_table(
+                df_local, station_id, neigh_ids, id_col=id_col, date_col=date_col, value_col=target_col,
+                start=start, end=end, min_overlap=min_overlap_corr
+            )
+    else:
+        df_local = df
+
+    if train_start or train_end:
+        lo = pd.to_datetime(train_start) if train_start else df_local[date_col].min()
+        hi = pd.to_datetime(train_end)   if train_end   else df_local[date_col].max()
+        df_local = df_local[(df_local[date_col] >= lo) & (df_local[date_col] <= hi)]
+
+    df_local = _add_time_features(_ensure_datetime(df_local, date_col), date_col, add_cyclic=add_cyclic)
+    if feature_cols is None:
+        feature_cols = [lat_col, lon_col, alt_col, "año", "mes", "dia_del_año"] + (["doy_sin","doy_cos"] if add_cyclic else [])
+
+    train_rest = df_local[df_local[id_col] != station_id]
+    sample_target = _sample_target_for_training(
+        df_local, id_col=id_col, date_col=date_col, target_col=target_col, feature_cols=feature_cols,
+        station_id=station_id, include_target_pct=include_target_pct, random_state=include_target_seed
+    )
+    train_df = pd.concat([train_rest, sample_target], axis=0, copy=False)
+    train_df = train_df.dropna(subset=feature_cols + [target_col])
+    if train_df.empty:
+        raise ValueError("El conjunto de entrenamiento quedó vacío tras filtrar/muestrear.")
+
+    st = df[df[id_col] == station_id]
+    if st.empty:
+        raise ValueError(f"No hay registros para la estación {station_id} en el periodo.")
+    lat0, lon0, alt0 = st[lat_col].median(), st[lon_col].median(), st[alt_col].median()
+
+    dates = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq="D")
+    synth = pd.DataFrame({date_col: dates, "estacion": station_id, lat_col: lat0, lon_col: lon0, alt_col: alt0})
+    synth = _add_time_features(synth, date_col, add_cyclic=add_cyclic)
+
+    model = RandomForestRegressor(**rf_params)
+    model.fit(train_df[feature_cols], train_df[target_col])
+    y_pred_full = model.predict(synth[feature_cols])
+
+    full_df = synth[[date_col, "estacion"]].copy()
+    full_df["y_pred_full"] = y_pred_full
+    obs = df[df[id_col] == station_id][[date_col, target_col]].rename(columns={target_col: "y_true"})
+    full_df = full_df.merge(obs, on=date_col, how="left")
+
+    comp = full_df.dropna(subset=["y_true"]).copy()
+    comp["y_pred"] = comp["y_pred_full"]
+    daily = _metrics(comp["y_true"], comp["y_pred"])
+    monthly, _ = _aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="M", agg="sum")
+    annual, _ = _aggregate_and_score(comp, date_col=date_col, y_col="y_true", yhat_col="y_pred", freq="YE", agg="sum")
+    metrics = {"daily": daily, "monthly": monthly, "annual": annual}
+
+    return full_df, metrics, model, feature_cols, corr_tab
+
+
