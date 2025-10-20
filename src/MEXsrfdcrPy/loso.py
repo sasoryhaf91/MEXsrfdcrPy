@@ -29,7 +29,7 @@ import json
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -1144,200 +1144,6 @@ def export_full_series_batch(
         manifest.to_csv(manifest_path, index=False)
     return manifest
 
-
-# ---------------------------------------------------------------------
-# Plot helper: Observed vs RF vs external (e.g., NASA)
-# ---------------------------------------------------------------------
-def plot_compare_obs_rf_nasa(
-    data: pd.DataFrame,
-    *,
-    station_id: int,
-    # columnas base
-    id_col: str = "station",
-    date_col: str = "date",
-    # columnas de series (pueden ser None)
-    obs_col: Optional[str] = "tmax",
-    nasa_col: Optional[str] = None,
-    rf_df: Optional[pd.DataFrame] = None,
-    rf_date_col: str = "date",
-    rf_value_col: Optional[str] = "y_pred_full",
-    rf_label: Optional[str] = "RF",
-    # recorte temporal
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    # agregación / suavizado (None = sin aplicar)
-    resample: Optional[str] = "D",          # "D","M","YE" o None
-    agg: Optional[str] = "mean",            # "mean"|"sum"|"median" o None→"mean"
-    smooth: Optional[int] = None,           # ventana rolling
-    # estética y salida (opcionales)
-    figsize: Optional[Tuple[int, int]] = (12, 5),
-    title: Optional[str] = None,
-    ylabel: Optional[str] = None,
-    legend_loc: Optional[str] = "best",
-    grid: Optional[bool] = True,
-    xlim: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
-    ylim: Optional[Tuple[float, float]] = None,
-    date_fmt: Optional[str] = None,         # p.ej. "%Y"
-    save_to: Optional[str] = None,
-    # estilos por serie (dicts opcionales)
-    obs_style: Optional[Dict] = None,       # {"marker":"o","ms":3,"alpha":0.7,"color":"#37474F","ls":""}
-    nasa_style: Optional[Dict] = None,      # {"lw":2.0,"alpha":0.9,"color":"#B71C1C"}
-    rf_style: Optional[Dict] = None,        # {"lw":2.0,"alpha":0.9,"color":"#1E88E5"}
-) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
-    """
-    Grafica OBS (opcional), NASA/externo (opcional) y RF (opcional).
-    Acepta None en cualquiera de las entradas. Devuelve (fig, ax, metrics),
-    donde 'metrics' solo contiene claves para series evaluadas CONTRA observado.
-    """
-    # ---------- helpers ----------
-    def _ensure_dt(s: pd.Series) -> pd.Series:
-        if not np.issubdtype(s.dtype, np.datetime64):
-            s = pd.to_datetime(s, errors="coerce")
-        if pd.api.types.is_datetime64tz_dtype(s):
-            s = s.dt.tz_localize(None)
-        return s
-
-    def _clip_period(df: pd.DataFrame, cdate: str) -> pd.DataFrame:
-        out = df.copy()
-        out[cdate] = _ensure_dt(out[cdate])
-        if start or end:
-            lo = pd.to_datetime(start) if start else out[cdate].min()
-            hi = pd.to_datetime(end) if end else out[cdate].max()
-            out = out[(out[cdate] >= lo) & (out[cdate] <= hi)]
-        return out
-
-    def _prep_series(s: pd.Series) -> pd.Series:
-        out = s.copy().sort_index()
-        if resample is not None:
-            op = (agg or "mean").lower()
-            if op == "sum":
-                out = out.resample(resample).sum()
-            elif op == "median":
-                out = out.resample(resample).median()
-            else:
-                out = out.resample(resample).mean()
-        if smooth and isinstance(smooth, int) and smooth > 1:
-            out = out.rolling(smooth, min_periods=1, center=True).mean()
-        return out
-
-    # ---------- base ----------
-    base = data.copy()
-    if id_col in base.columns:
-        base = base[base[id_col] == station_id]
-    if base.empty:
-        raise ValueError(f"No hay datos para estación {station_id}.")
-    base = _clip_period(base, date_col)
-
-    series = {}   # nombre -> Series indexadas por fecha
-    labels = {}
-    metrics: Dict[str, Dict[str, float]] = {}
-
-    # ---------- OBS (opcional) ----------
-    if obs_col is not None and obs_col in base.columns:
-        obs = base[[date_col, obs_col]].dropna().rename(columns={obs_col: "obs"})
-        obs[date_col] = _ensure_dt(obs[date_col])
-        obs = obs.set_index(date_col).sort_index()
-        if not obs.empty:
-            series["obs"] = obs["obs"]
-            labels["obs"] = "Observed"
-
-    # ---------- NASA (opcional) ----------
-    if nasa_col is not None and nasa_col in base.columns:
-        nasa = base[[date_col, nasa_col]].dropna().rename(columns={nasa_col: "nasa"})
-        nasa[date_col] = _ensure_dt(nasa[date_col])
-        nasa = nasa.set_index(date_col).sort_index()
-        if not nasa.empty:
-            series["nasa"] = nasa["nasa"]
-            labels["nasa"] = f"{nasa_col}"
-
-    # ---------- RF (opcional) ----------
-    if rf_df is not None and rf_value_col is not None and rf_value_col in rf_df.columns:
-        rf = rf_df.copy()
-        rf[rf_date_col] = _ensure_dt(rf[rf_date_col])
-        rf = _clip_period(rf, rf_date_col)
-        rf = rf[[rf_date_col, rf_value_col]].dropna()
-        rf = rf.set_index(rf_date_col).sort_index()
-        if not rf.empty:
-            series["rf"] = rf[rf_value_col]
-            labels["rf"] = rf_label or "RF"
-
-    if len(series) == 0:
-        raise ValueError("No hay ninguna serie para graficar (todas son None o vacías).")
-
-    # ---------- métricas (solo si hay OBS) ----------
-    if "obs" in series:
-        from numpy import nan
-        def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
-            pair = pd.concat([a, b], axis=1, join="inner").dropna()
-            if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
-                return dict(MAE=nan, RMSE=nan, R2=nan)
-            return {
-                "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
-                "RMSE": mean_squared_error(pair.iloc[:, 0], pair.iloc[:, 1], squared=False),
-                "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
-            }
-        if "nasa" in series:
-            metrics["nasa"] = _pair_metrics(series["obs"], series["nasa"])
-        if "rf" in series:
-            metrics["rf"] = _pair_metrics(series["obs"], series["rf"])
-
-    # ---------- preparar para plot ----------
-    for k in list(series.keys()):
-        series[k] = _prep_series(series[k])
-
-    # estilos por defecto (se pueden sobrescribir con *_style)
-    obs_style  = dict({"marker":"o","ms":3,"alpha":0.7,"color":"#37474F","ls":""}, **(obs_style or {}))
-    nasa_style = dict({"lw":2.0,"alpha":0.9,"color":"#B71C1C"}, **(nasa_style or {}))
-    rf_style   = dict({"lw":2.0,"alpha":0.9,"color":"#1E88E5"}, **(rf_style or {}))
-
-    # ---------- plot ----------
-    fig, ax = plt.subplots(figsize=figsize or (12, 5))
-
-    if "obs" in series:
-        ax.plot(series["obs"].index, series["obs"].values, label=labels["obs"], **obs_style)
-    if "nasa" in series:
-        lbl = labels["nasa"]
-        if "nasa" in metrics:  # añade métricas a la etiqueta
-            m = metrics["nasa"]
-            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
-        ax.plot(series["nasa"].index, series["nasa"].values, label=lbl, **nasa_style)
-    if "rf" in series:
-        lbl = labels["rf"]
-        if "rf" in metrics:
-            m = metrics["rf"]
-            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
-        ax.plot(series["rf"].index, series["rf"].values, label=lbl, **rf_style)
-
-    # títulos / ejes
-    if title is None:
-        # intenta inferir etiqueta del eje si hay observado
-        ylab = (ylabel if ylabel is not None else (obs_col.upper() if obs_col else "Value"))
-        title = f"Station {station_id} — {ylab}"
-    ax.set_title(title)
-    ax.set_xlabel("Date")
-    if ylabel is not None:
-        ax.set_ylabel(ylabel)
-
-    if grid:
-        ax.grid(ls=":", alpha=0.5)
-
-    if xlim is not None:
-        ax.set_xlim(xlim)
-    if ylim is not None:
-        ax.set_ylim(ylim)
-
-    if date_fmt is not None:
-        import matplotlib.dates as mdates
-        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
-
-    ax.legend(frameon=False, loc=legend_loc or "best")
-
-    if save_to:
-        fig.savefig(save_to, dpi=300, bbox_inches="tight")
-
-    return fig, ax, metrics
-
-
 # --- FAST full-series LOSO (neighbors + single-pass prep) --------------------
 def loso_predict_full_series_fast(
     data: pd.DataFrame,
@@ -1504,6 +1310,311 @@ def loso_predict_full_series_fast(
     _save_json(metrics, save_metrics_path)
 
     return full_df, metrics, model, feats
+
+#________________________PLOT NEW_____________________--
+
+
+def plot_compare_obs_rf_nasa(
+    data: pd.DataFrame,
+    *,
+    station_id: int,
+    # base columns in `data`
+    id_col: str = "station",
+    date_col: str = "date",
+    # which columns to use (can be None to skip a series)
+    obs_col: Optional[str] = "prec",
+    nasa_col: Optional[str] = None,
+    rf_df: Optional[pd.DataFrame] = None,
+    rf_date_col: str = "date",
+    rf_value_col: Optional[str] = "y_pred_full",
+    rf_label: Optional[str] = "RF",
+    # NEW: arbitrary external source (grid, reanalysis, another model, etc.)
+    extra: Optional[Union[pd.DataFrame, pd.Series, np.ndarray, list]] = None,
+    extra_date_col: str = "date",
+    extra_value_col: Optional[str] = None,
+    extra_label: str = "External",
+    # time window and transformations
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    resample: Optional[str] = "D",     # "D", "M", "YE", or None
+    agg: Optional[str] = "mean",       # "mean" | "sum" | "median"; used if resample is not None
+    smooth: Optional[int] = None,      # rolling window (centered)
+    # plot aesthetics / IO
+    figsize: Optional[Tuple[int, int]] = (12, 5),
+    title: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    legend_loc: Optional[str] = "best",
+    grid: Optional[bool] = True,
+    xlim: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    date_fmt: Optional[str] = None,
+    save_to: Optional[str] = None,
+    # style dictionaries (optional overrides)
+    obs_style: Optional[Dict] = None,       # points by default
+    nasa_style: Optional[Dict] = None,      # line by default
+    rf_style: Optional[Dict] = None,        # line by default
+    extra_style: Optional[Dict] = None,     # line by default
+) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
+    """
+    Plot Observed vs. RF vs. NASA with an optional fourth external series, and
+    report MAE/RMSE/R² (computed against Observed where available).
+
+    Parameters
+    ----------
+    data : DataFrame
+        Long-format table containing at least [id_col, date_col] and whichever
+        of `obs_col` / `nasa_col` you want to show.
+    station_id : int
+        Station/cell identifier to filter from `data`.
+    id_col, date_col : str
+        Column names in `data`.
+    obs_col : str or None
+        Observed column in `data` (None to skip). If present, metrics are
+        computed against this series.
+    nasa_col : str or None
+        Optional column in `data` for an external NASA (or similar) series.
+    rf_df : DataFrame or None
+        Optional DataFrame for the RF series. If provided, must include
+        [rf_date_col, rf_value_col]. It is independent from `data`.
+    rf_date_col, rf_value_col : str
+        Column names in `rf_df` for date/value.
+    rf_label : str
+        Label for the RF series in the legend.
+    extra : DataFrame | Series | ndarray | list | None
+        NEW: arbitrary external source to compare (e.g., grid predictions at
+        this point). Accepts:
+        - DataFrame with [extra_date_col, extra_value_col], or
+        - Series indexed by datetime, or
+        - array/list aligned to the observed after resampling (same length/order).
+    extra_date_col, extra_value_col : str
+        Column names to resolve the `extra` DataFrame into a time series.
+        Ignored if `extra` is a Series/array.
+    extra_label : str
+        Legend label for the extra series.
+    start, end : str or None
+        Optional date window to clip all series before resampling.
+    resample : str or None
+        Pandas offset alias to resample (e.g., "D", "M", "YE"). If None, no resampling.
+    agg : str or None
+        Aggregation when resampling: "mean", "sum", or "median". Ignored if resample=None.
+    smooth : int or None
+        Rolling window size (centered) applied after resampling.
+    figsize, title, ylabel, legend_loc, grid, xlim, ylim, date_fmt, save_to
+        Plot settings and optional output file path.
+    obs_style, nasa_style, rf_style, extra_style : dict or None
+        Optional Matplotlib style dictionaries per series.
+
+    Returns
+    -------
+    (fig, ax, metrics) :
+        Figure, axes, and a dict with metrics for any series compared vs Observed
+        (keys: "nasa", "rf", "extra" when available).
+
+    Notes
+    -----
+    - All series are aligned by an inner-join on the datetime index for metrics.
+    - If `obs_col` is None or not present, metrics are not computed.
+    - This function is resilient to missing series: it plots what is available.
+    """
+
+    # ------------------------ helpers ------------------------
+    def _ensure_dt(s: pd.Series) -> pd.Series:
+        s = pd.to_datetime(s, errors="coerce")
+        if pd.api.types.is_datetime64tz_dtype(s):
+            s = s.dt.tz_localize(None)
+        return s
+
+    def _clip(df: pd.DataFrame, dcol: str) -> pd.DataFrame:
+        out = df.copy()
+        out[dcol] = _ensure_dt(out[dcol])
+        if start or end:
+            lo = pd.to_datetime(start) if start else out[dcol].min()
+            hi = pd.to_datetime(end) if end else out[dcol].max()
+            out = out[(out[dcol] >= lo) & (out[dcol] <= hi)]
+        return out
+
+    def _prep(series: pd.Series) -> pd.Series:
+        s = series.sort_index()
+        if resample is not None:
+            op = (agg or "mean").lower()
+            if op == "sum":
+                s = s.resample(resample).sum()
+            elif op == "median":
+                s = s.resample(resample).median()
+            else:
+                s = s.resample(resample).mean()
+        if smooth and isinstance(smooth, int) and smooth > 1:
+            s = s.rolling(smooth, min_periods=1, center=True).mean()
+        return s
+
+    def _to_series(obj, dcol: str, vcol: Optional[str]) -> pd.Series:
+        """Resolve a DataFrame/Series/array into a pd.Series indexed by datetime."""
+        if obj is None:
+            return pd.Series(dtype=float)
+        if isinstance(obj, pd.Series):
+            s = obj.copy()
+            if not np.issubdtype(s.index.dtype, np.datetime64):
+                # try to treat values as a vector aligned later (will handle below)
+                raise ValueError("A plain Series must be datetime-indexed.")
+            return s.sort_index()
+        if isinstance(obj, (list, np.ndarray)):
+            return pd.Series(obj)  # length alignment handled later
+        if isinstance(obj, pd.DataFrame):
+            if vcol is None or dcol not in obj.columns or vcol not in obj.columns:
+                raise ValueError("For a DataFrame `extra`, provide valid extra_date_col and extra_value_col.")
+            tmp = obj[[dcol, vcol]].dropna().copy()
+            tmp[dcol] = _ensure_dt(tmp[dcol])
+            tmp = tmp.set_index(dcol).sort_index()[vcol]
+            return tmp
+        raise TypeError("Unsupported type for `extra`. Use DataFrame/Series/ndarray/list.")
+
+    # ------------------------ base selection ------------------------
+    base = data.copy()
+    if id_col in base.columns:
+        base = base[base[id_col] == station_id]
+    if base.empty:
+        raise ValueError(f"No data for station {station_id}.")
+    base = _clip(base, date_col)
+
+    series: Dict[str, pd.Series] = {}
+    labels: Dict[str, str] = {}
+    metrics: Dict[str, Dict[str, float]] = {}
+
+    # OBS
+    if obs_col is not None and obs_col in base.columns:
+        obs = base[[date_col, obs_col]].dropna().rename(columns={obs_col: "obs"})
+        obs[date_col] = _ensure_dt(obs[date_col])
+        obs = obs.set_index(date_col).sort_index()["obs"]
+        if not obs.empty:
+            series["obs"] = obs
+            labels["obs"] = "Observed"
+
+    # NASA
+    if nasa_col is not None and nasa_col in base.columns:
+        nasa = base[[date_col, nasa_col]].dropna().rename(columns={nasa_col: "nasa"})
+        nasa[date_col] = _ensure_dt(nasa[date_col])
+        nasa = nasa.set_index(date_col).sort_index()["nasa"]
+        if not nasa.empty:
+            series["nasa"] = nasa
+            labels["nasa"] = str(nasa_col)
+
+    # RF
+    if rf_df is not None and rf_value_col is not None and rf_value_col in rf_df.columns:
+        rf = rf_df.copy()
+        rf[rf_date_col] = _ensure_dt(rf[rf_date_col])
+        rf = _clip(rf, rf_date_col)
+        rf = rf[[rf_date_col, rf_value_col]].dropna().set_index(rf_date_col).sort_index()[rf_value_col]
+        if not rf.empty:
+            series["rf"] = rf
+            labels["rf"] = rf_label or "RF"
+
+    # EXTRA (NEW)
+    extra_series = None
+    if extra is not None:
+        try:
+            extra_series = _to_series(extra, extra_date_col, extra_value_col)
+        except Exception as e:
+            raise ValueError(f"Could not resolve `extra` into a time series: {e}")
+
+        # If it's a plain vector (no datetime index), align by length after resampling
+        if not isinstance(extra_series.index, pd.DatetimeIndex):
+            if "obs" not in series:
+                raise ValueError("Non-indexed `extra` requires an observed series to align lengths.")
+            # Prepare obs first to know target length; postpone alignment
+        else:
+            series["extra"] = extra_series
+            labels["extra"] = extra_label
+
+    # If extra was a plain vector, integrate it now after we prepare obs
+    def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
+        pair = pd.concat([a, b], axis=1, join="inner").dropna()
+        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
+            return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
+        return {
+            "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
+            "RMSE": mean_squared_error(pair.iloc[:, 0], pair.iloc[:, 1], squared=False),
+            "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
+        }
+
+    # ------------------------ resample / smooth ------------------------
+    # Do it in-place to preserve keys
+    for k in list(series.keys()):
+        series[k] = _prep(series[k])
+
+    # If extra is a vector, align length with the (resampled) observed
+    if extra is not None and not isinstance(extra_series.index, pd.DatetimeIndex):
+        if "obs" not in series:
+            raise ValueError("Cannot align vector `extra` without an observed series.")
+        obs_idx = series["obs"].index
+        vec = pd.Series(extra_series, index=pd.RangeIndex(len(extra_series)))
+        if len(vec) != len(series["obs"]):
+            raise ValueError(f"Length mismatch: extra({len(vec)}) vs observed({len(series['obs'])}).")
+        series["extra"] = pd.Series(np.asarray(vec.values, dtype=float), index=obs_idx)
+        labels["extra"] = extra_label
+
+    # ------------------------ metrics ------------------------
+    if "obs" in series:
+        if "nasa" in series:
+            metrics["nasa"] = _pair_metrics(series["obs"], series["nasa"])
+        if "rf" in series:
+            metrics["rf"] = _pair_metrics(series["obs"], series["rf"])
+        if "extra" in series:
+            metrics["extra"] = _pair_metrics(series["obs"], series["extra"])
+
+    # ------------------------ plot ------------------------
+    # Default styles
+    obs_style  = dict({"marker": "o", "ms": 3, "alpha": 0.7, "color": "#37474F", "ls": ""}, **(obs_style or {}))
+    nasa_style = dict({"lw": 2.0, "alpha": 0.9, "color": "#B71C1C"}, **(nasa_style or {}))
+    rf_style   = dict({"lw": 2.0, "alpha": 0.9, "color": "#1E88E5"}, **(rf_style or {}))
+    extra_style = dict({"lw": 2.0, "alpha": 0.9, "color": "#43A047"}, **(extra_style or {}))
+
+    fig, ax = plt.subplots(figsize=figsize or (12, 5))
+
+    if "obs" in series:
+        ax.plot(series["obs"].index, series["obs"].values, label=labels["obs"], **obs_style)
+    if "nasa" in series:
+        lbl = labels["nasa"]
+        if "nasa" in metrics:
+            m = metrics["nasa"]
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+        ax.plot(series["nasa"].index, series["nasa"].values, label=lbl, **nasa_style)
+    if "rf" in series:
+        lbl = labels["rf"]
+        if "rf" in metrics:
+            m = metrics["rf"]
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+        ax.plot(series["rf"].index, series["rf"].values, label=lbl, **rf_style)
+    if "extra" in series:
+        lbl = labels["extra"]
+        if "extra" in metrics:
+            m = metrics["extra"]
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+        ax.plot(series["extra"].index, series["extra"].values, label=lbl, **extra_style)
+
+    # Titles / axes
+    if title is None:
+        ylab = (ylabel if ylabel is not None else (obs_col.upper() if obs_col else "Value"))
+        title = f"Station {station_id} — {ylab}"
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    if grid:
+        ax.grid(ls=":", alpha=0.5)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    if date_fmt is not None:
+        import matplotlib.dates as mdates
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
+    ax.legend(frameon=False, loc=legend_loc or "best")
+
+    if save_to:
+        fig.savefig(save_to, dpi=300, bbox_inches="tight")
+
+    return fig, ax, metrics
+
 
 __all__ = [
     # core & full series
