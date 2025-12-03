@@ -27,29 +27,38 @@ Global (single-model) daily prediction utilities for station grids.
 This module provides two main entry points:
 
 1) :func:`train_global_rf_target`  
-   Trains a **single** `RandomForestRegressor` using all stations that meet a
-   minimum row threshold within a target period. The function persists:
+   Trains a **single** :class:`sklearn.ensemble.RandomForestRegressor` using
+   all stations that meet a minimum row threshold within a target period.
+   The function persists:
+
    - the fitted model as a joblib artifact, and
    - a JSON metadata file describing columns, features and training settings.
 
-   The *target variable is generic* (e.g. daily precipitation `prec`,
-   minimum temperature `tmin`, maximum temperature `tmax`, evaporation `evap`,
-   or any other numeric daily target available in the input table).
+   The *target variable is generic* (e.g. daily precipitation ``prec``,
+   minimum temperature ``tmin``, maximum temperature ``tmax``, evaporation
+   ``evap``, or any other numeric daily target available in the input table).
 
 2) :func:`predict_grid_daily_with_global_model`  
    Loads the persisted model and produces daily predictions for **any station
    grid** (columns: station id, latitude, longitude, altitude) over a requested
    date span. The function:
+
    - reproduces the time features used at train time,
    - honors extra covariates if the global model included them,
    - returns or streams a long-format table **including coordinates**.
 
-The implementation is self-contained and depends only on:
-`pandas`, `numpy`, `scikit-learn`, and `joblib`. Optional `pyarrow` is used
-**only** when streaming large predictions to Parquet (recommended for big grids).
+Additionally, convenience wrappers allow predictions at arbitrary points
+(:func:`predict_points_daily_with_global_model`,
+:func:`predict_at_point_daily_with_global_model`), and small helpers simplify
+post-processing (:func:`slice_station_series`, :func:`grid_nan_report`).
 
-The design is deliberately "plain" to be easy to reproduce, audit and extend in
-a JOSS context.
+The implementation is deliberately "plain" to be easy to reproduce, audit and
+extend in a JOSS context.
+
+Dependencies
+------------
+- Core: :mod:`pandas`, :mod:`numpy`, :mod:`scikit-learn`, :mod:`joblib`
+- Optional (for streaming to Parquet): :mod:`pyarrow`
 
 Examples
 --------
@@ -77,9 +86,9 @@ Examples
 ...     out_path=None,  # or "preds/global_rf_prec_grid.parquet" to stream
 ... )
 >>> preds.head()
-station | date       | y_pred_full | latitude | longitude | altitude
---------+------------+-------------+----------+-----------+---------
-10001   | 1991-01-01 |   0.514     |  24.64   | -103.69   |  1950.0
+station | date       | latitude | longitude | altitude | y_pred_full
+--------+------------+----------+-----------+----------+-----------
+10001   | 1991-01-01 |  24.64   | -103.69   |  1950.0  |   0.514
 ...
 
 """
@@ -87,7 +96,7 @@ station | date       | y_pred_full | latitude | longitude | altitude
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import json
 import os
@@ -98,9 +107,6 @@ from joblib import dump, load
 from sklearn.ensemble import RandomForestRegressor
 
 
-
-
-
 __all__ = [
     "GlobalModelMeta",
     "train_global_rf_target",
@@ -108,7 +114,7 @@ __all__ = [
     "slice_station_series",
     "grid_nan_report",
     "predict_points_daily_with_global_model",
-    "predict_at_point_daily_with_global_model"
+    "predict_at_point_daily_with_global_model",
 ]
 
 
@@ -118,16 +124,58 @@ __all__ = [
 
 
 def _ensure_datetime(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    """Return a shallow copy with a timezone-naive datetime column."""
+    """
+    Return a shallow copy with a timezone-naive datetime column.
+
+    The function:
+
+    - parses the column to pandas datetime (coercing invalid values to NaT),
+    - removes timezone information, if present,
+    - drops rows with NaT in the date column.
+
+    Parameters
+    ----------
+    df :
+        Input DataFrame.
+    date_col :
+        Name of the date column.
+
+    Returns
+    -------
+    DataFrame
+        Copy of the input with a cleaned datetime column.
+    """
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    if pd.api.types.is_datetime64tz_dtype(out[date_col]):
-        out[date_col] = out[date_col].dt.tz_localize(None)
+
+    # Avoid deprecated `is_datetime64tz_dtype`; check dtype.tz instead.
+    dtype = out[date_col].dtype
+    if getattr(dtype, "tz", None) is not None:
+        # Convert to naive UTC (or localize to None); for climate daily data
+        # we typically only care about the calendar date, not the timezone.
+        out[date_col] = out[date_col].dt.tz_convert(None)
+
     return out.dropna(subset=[date_col])
 
 
 def _add_time_features(df: pd.DataFrame, date_col: str, add_cyclic: bool) -> pd.DataFrame:
-    """Add year/month/day-of-year (+ optional sin/cos) to *df* and return a copy."""
+    """
+    Add calendar (year/month/day-of-year) and optional cyclic features.
+
+    Parameters
+    ----------
+    df :
+        Input DataFrame with a datetime column.
+    date_col :
+        Name of the datetime column.
+    add_cyclic :
+        If ``True``, also add ``doy_sin`` and ``doy_cos``.
+
+    Returns
+    -------
+    DataFrame
+        Copy of the input with additional time features.
+    """
     out = df.copy()
     out["year"] = out[date_col].dt.year.astype("int16", copy=False)
     out["month"] = out[date_col].dt.month.astype("int8", copy=False)
@@ -139,6 +187,16 @@ def _add_time_features(df: pd.DataFrame, date_col: str, add_cyclic: bool) -> pd.
 
 
 def _save_json(obj: dict, path: str) -> None:
+    """
+    Save a Python dictionary as a JSON file.
+
+    Parameters
+    ----------
+    obj :
+        Serializable dictionary.
+    path :
+        Output file path.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -151,27 +209,32 @@ def _save_json(obj: dict, path: str) -> None:
 
 @dataclass(frozen=True)
 class GlobalModelMeta:
-    """Metadata persisted alongside the trained model.
+    """
+    Metadata persisted alongside the trained global model.
+
+    This object captures the configuration used at training time so that
+    downstream prediction functions can reconstruct the exact feature space
+    and interpret the model correctly.
 
     Attributes
     ----------
-    id_col, date_col, lat_col, lon_col, alt_col, target_col
+    id_col, date_col, lat_col, lon_col, alt_col, target_col :
         Column names used at training time.
-    start, end
-        Training period [inclusive] in `YYYY-MM-DD` format.
-    min_rows_per_station
+    start, end :
+        Training period [inclusive] in ``YYYY-MM-DD`` format.
+    min_rows_per_station :
         Minimum valid rows per station to be included in training.
-    add_cyclic
+    add_cyclic :
         Whether cyclic time features (sin/cos of day-of-year) were used.
-    rf_params
-        Dictionary of `RandomForestRegressor` parameters.
-    features
+    rf_params :
+        Dictionary of :class:`RandomForestRegressor` parameters.
+    features :
         Final ordered list of **feature names** expected by the model.
-    n_train_rows
+    n_train_rows :
         Number of training rows used.
-    n_stations_used
+    n_stations_used :
         Number of stations that met the threshold.
-    stations_used_sorted
+    stations_used_sorted :
         Sorted list of station identifiers used for training.
     """
 
@@ -193,11 +256,32 @@ class GlobalModelMeta:
 
     @staticmethod
     def load(path: str) -> "GlobalModelMeta":
+        """
+        Load metadata from a JSON file.
+
+        Parameters
+        ----------
+        path :
+            Path to a JSON file created by :meth:`save`.
+
+        Returns
+        -------
+        GlobalModelMeta
+            Parsed metadata.
+        """
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
         return GlobalModelMeta(**d)
 
     def save(self, path: str) -> None:
+        """
+        Save the metadata as JSON.
+
+        Parameters
+        ----------
+        path :
+            Output file path.
+        """
         _save_json(self.__dict__, path)
 
 
@@ -228,40 +312,46 @@ def train_global_rf_target(
     model_path: str = "models/global_rf_target.joblib",
     meta_path: str = "models/global_rf_target.meta.json",
 ) -> Tuple[RandomForestRegressor, GlobalModelMeta, pd.DataFrame]:
-    """Train a single global `RandomForestRegressor` for a daily *target*.
+    """
+    Train a single global :class:`RandomForestRegressor` for a daily *target*.
 
-    This is target-agnostic: pass `target_col="prec"` (precipitation),
-    `target_col="tmin"`, `target_col="tmax"`, `target_col="evap"`, etc.
+    This function is target-agnostic: for example, use
+    ``target_col="prec"`` (precipitation), ``target_col="tmin"``,
+    ``target_col="tmax"``, ``target_col="evap"`` or any other numeric
+    daily variable.
 
     Parameters
     ----------
-    data
-        Long-format daily table with at least:
-        [id_col, date_col, lat_col, lon_col, alt_col, target_col].
-    id_col, date_col, lat_col, lon_col, alt_col, target_col
-        Column names in `data`.
-    start, end
-        Inclusive date span for training (YYYY-MM-DD).
-    min_rows_per_station
-        Minimum valid training rows per station to be kept (e.g., 1825 ≈ 5 years).
-    add_cyclic
-        If True, include sin/cos(doy) features.
-    extra_feature_cols
-        Optional additional covariates available both at training time and later
-        for grid prediction. Columns not found in `data` are ignored safely.
-    rf_params
-        Parameters for `sklearn.ensemble.RandomForestRegressor`.
-    model_path, meta_path
+    data :
+        Long-format daily table with at least the columns:
+        ``[id_col, date_col, lat_col, lon_col, alt_col, target_col]``.
+    id_col, date_col, lat_col, lon_col, alt_col, target_col :
+        Column names in ``data``.
+    start, end :
+        Inclusive date span for training (``YYYY-MM-DD``).
+    min_rows_per_station :
+        Minimum valid training rows per station to be kept
+        (e.g. 1825 ≈ 5 years).
+    add_cyclic :
+        If ``True``, include sin/cos(day-of-year) features.
+    extra_feature_cols :
+        Optional additional covariates available both at training time and
+        later for grid prediction. Columns not found in ``data`` are ignored.
+    rf_params :
+        Parameters for :class:`sklearn.ensemble.RandomForestRegressor`.
+    model_path, meta_path :
         Output paths for the model (joblib) and metadata (JSON).
 
     Returns
     -------
-    model
-        Fitted `RandomForestRegressor`.
-    meta
-        `GlobalModelMeta` describing training settings (and the expected features).
-    station_summary
-        Two-column DataFrame [id_col, valid_rows] for stations used in training.
+    model :
+        Fitted :class:`RandomForestRegressor`.
+    meta :
+        :class:`GlobalModelMeta` describing training settings and the expected
+        feature list.
+    station_summary :
+        Two-column DataFrame ``[id_col, "valid_rows"]`` for stations used in
+        training, sorted by ``valid_rows`` (descending).
     """
     # 1) Period selection and time features
     df = _ensure_datetime(data, date_col)
@@ -298,7 +388,7 @@ def train_global_rf_target(
 
     df_train = dfv[dfv[id_col].astype(int).isin(keep_ids)].copy()
 
-    # 4) Fit Random-Forest
+    # 4) Fit RandomForest
     X = df_train[features].to_numpy(copy=False)
     y = df_train[target_col].to_numpy(copy=False)
     model = RandomForestRegressor(**rf_params)
@@ -362,37 +452,50 @@ def predict_grid_daily_with_global_model(
     out_path: Optional[str] = None,
     parquet_compression: str = "snappy",
 ) -> Optional[pd.DataFrame]:
-    """Predict a daily series for a station grid using the saved global model.
+    """
+    Predict a daily series for a station grid using the saved global model.
 
     Parameters
     ----------
-    grid_df
-        DataFrame with columns [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col].
+    grid_df :
+        DataFrame with columns
+        ``[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]``.
         Each row is a station/cell to be predicted (one row per station).
-    model_path, meta_path
-        Paths to the persisted model and metadata created by `train_global_rf_target`.
-    start, end
-        Inclusive date span for predictions (YYYY-MM-DD).
-    batch_days
-        Number of consecutive days per batch (trade-off between RAM and speed).
-    out_path
+    model_path, meta_path :
+        Paths to the persisted model and metadata created by
+        :func:`train_global_rf_target`.
+    grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col :
+        Column names in ``grid_df`` for the station identifier and
+        coordinates.
+    start, end :
+        Inclusive date span for predictions (``YYYY-MM-DD``).
+    batch_days :
+        Number of consecutive days per batch (trade-off between RAM and
+        speed).
+    out_path :
         Optional Parquet path where predictions are streamed in batches
-        (recommended for large grids). When provided, this function returns None.
-    parquet_compression
-        Compression codec if `out_path` is provided.
+        (recommended for large grids). When provided, this function
+        returns ``None``.
+    parquet_compression :
+        Compression codec if ``out_path`` is provided.
 
     Returns
     -------
     DataFrame or None
-        If `out_path` is None, returns a DataFrame with columns:
-        [grid_id_col, "date", "y_pred_full", grid_lat_col, grid_lon_col, grid_alt_col].
-        If `out_path` is provided, the function streams to disk and returns None.
+        If ``out_path`` is ``None``, returns a DataFrame with columns:
+
+        ``[grid_id_col, "date", grid_lat_col, grid_lon_col,
+        grid_alt_col, "y_pred_full"]``.
+
+        If ``out_path`` is provided, the function streams to disk and
+        returns ``None``.
 
     Notes
     -----
-    - The model expects the *same* feature columns (names/types) persisted in metadata.
-      If you trained with extra covariates, the corresponding columns must be available
-      here as well (per grid row and/or derivable per date).
+    The model expects the *same* feature columns (names/types) persisted
+    in the metadata. If you trained with extra covariates, the corresponding
+    columns must be available here as well (per grid row and/or derivable
+    per date).
     """
     # --- Load artifacts
     model: RandomForestRegressor = load(model_path)
@@ -436,6 +539,7 @@ def predict_grid_daily_with_global_model(
         if out_path is not None:
             import pyarrow as pa  # optional dependency; used only if streaming
             import pyarrow.parquet as pq
+
             os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
         # --- Batch over time
@@ -470,11 +574,14 @@ def predict_grid_daily_with_global_model(
 
             # --- Build output *including* coordinates
             out = cart[[grid_id_col, "date", meta.lat_col, meta.lon_col, meta.alt_col]].copy()
-            out = out.rename(columns=to_public)  # back to public names (latitude/longitude/altitude)
+            # Back to public names (latitude/longitude/altitude)
+            out = out.rename(columns=to_public)
             out["y_pred_full"] = y_hat.astype("float32")
 
             # Column order
-            out = out[[grid_id_col, "date", grid_lat_col, grid_lon_col, grid_alt_col, "y_pred_full"]]
+            out = out[
+                [grid_id_col, "date", grid_lat_col, grid_lon_col, grid_alt_col, "y_pred_full"]
+            ]
 
             # Accumulate or stream
             if out_path is None:
@@ -482,10 +589,14 @@ def predict_grid_daily_with_global_model(
             else:
                 table = pa.Table.from_pandas(out, preserve_index=False)
                 if writer is None:
-                    writer = pq.ParquetWriter(out_path, table.schema, compression=parquet_compression)
+                    writer = pq.ParquetWriter(
+                        out_path,
+                        table.schema,
+                        compression=parquet_compression,
+                    )
                 writer.write_table(table)
 
-            # Light progress (useful for very large grids)
+            # Light progress (useful for very large grids in interactive runs)
             print(f"[grid-predict] {len(dates_chunk)} days × {len(g)} stations")
 
     finally:
@@ -509,22 +620,24 @@ def slice_station_series(
     id_col: str = "station",
     date_col: str = "date",
 ) -> pd.DataFrame:
-    """Return the time series for a single station from a long-format predictions table.
+    """
+    Return the time series for a single station from a predictions table.
 
     Parameters
     ----------
-    preds
-        Long-format DataFrame as returned by `predict_grid_daily_with_global_model`
-        (when `out_path=None`).
-    station_id
+    preds :
+        Long-format DataFrame as returned by
+        :func:`predict_grid_daily_with_global_model`
+        (when ``out_path=None``).
+    station_id :
         Station identifier to slice.
-    id_col, date_col
-        Column names in `preds`.
+    id_col, date_col :
+        Column names in ``preds``.
 
     Returns
     -------
     DataFrame
-        Subset with rows for `station_id` sorted by date.
+        Subset with rows for ``station_id`` sorted by date.
     """
     out = preds.loc[preds[id_col].astype(int) == int(station_id)].copy()
     if out.empty:
@@ -542,14 +655,32 @@ def grid_nan_report(
     lon_col: str = "longitude",
     alt_col: str = "altitude",
 ) -> pd.DataFrame:
-    """Quick NA report for a grid table.
+    """
+    Quick NA report for a grid table.
 
-    Returns a one-row dataframe with counts of missing values per required column.
-    Useful before calling `predict_grid_daily_with_global_model`.
+    Parameters
+    ----------
+    grid_df :
+        Input grid table.
+    id_col, lat_col, lon_col, alt_col :
+        Column names that are required for grid predictions.
+
+    Returns
+    -------
+    DataFrame
+        A one-row dataframe with counts of missing values per required
+        column. Useful before calling
+        :func:`predict_grid_daily_with_global_model`.
     """
     required = [id_col, lat_col, lon_col, alt_col]
     report = {c: int(grid_df[c].isna().sum()) if c in grid_df.columns else None for c in required}
     return pd.DataFrame([report])
+
+
+# ---------------------------------------------------------------------
+# Point normalization & point-wise prediction wrappers
+# ---------------------------------------------------------------------
+
 
 def _normalize_points_to_grid_df(
     points: Union[
@@ -567,20 +698,43 @@ def _normalize_points_to_grid_df(
     grid_alt_col: str = "altitude",
 ) -> pd.DataFrame:
     """
-    Normalize arbitrary point inputs into a 4-column grid DataFrame:
-    [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col].
+    Normalize arbitrary point inputs into a 4-column grid DataFrame.
 
-    Accepted inputs:
+    The resulting schema is::
+
+        [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]
+
+    Accepted inputs
+    ----------------
     - DataFrame with columns (station, latitude, longitude, altitude)
-    - dict or list[dict] with keys matching the column names
-    - list of tuples (lat, lon, alt)  -> station ids are auto-assigned 1..N
-    - list of tuples (station, lat, lon, alt)
+    - dict or list[dict] with some or all of those keys
+
+      * if ``grid_id_col`` is missing, station ids are auto-assigned.
+
+    - list of tuples ``(lat, lon, alt)``
+
+      * station ids are auto-assigned 1..N
+
+    - list of tuples ``(station, lat, lon, alt)``
+    - single tuple ``(lat, lon, alt)`` or ``(station, lat, lon, alt)``
 
     Returns
     -------
-    DataFrame with the four standard columns, dtype-coerced, no duplicates.
+    DataFrame
+        DataFrame with the four standard columns, dtype-coerced,
+        one row per point, and no duplicated station ids.
+
+    Raises
+    ------
+    ValueError
+        If required coordinate columns are missing or cannot be cast to
+        numeric.
+    TypeError
+        If the input format is not supported.
     """
-    def _as_df(obj) -> pd.DataFrame:
+
+    def _as_df(obj: object) -> pd.DataFrame:
+        # Already a DataFrame: validate and subset
         if isinstance(obj, pd.DataFrame):
             cols_need = {grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col}
             missing = cols_need - set(obj.columns)
@@ -588,59 +742,104 @@ def _normalize_points_to_grid_df(
                 raise ValueError(f"Input DataFrame is missing columns: {missing}")
             return obj[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
 
-        # single dict
+        # Single dict
         if isinstance(obj, dict):
-            return pd.DataFrame([obj])
+            d = dict(obj)  # shallow copy
+            # Auto-assign station id if missing
+            if grid_id_col not in d:
+                d[grid_id_col] = 1
+            for key in (grid_lat_col, grid_lon_col, grid_alt_col):
+                if key not in d:
+                    raise ValueError(f"Input dict is missing required key: {key!r}")
+            return pd.DataFrame([d])[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]]
 
-        # sequence (dicts or tuples)
-        if isinstance(obj, (list, tuple)):
+        # Single tuple (lat, lon, alt) or (station, lat, lon, alt)
+        if isinstance(obj, tuple):
+            if len(obj) == 3:
+                lat, lon, alt = obj
+                return pd.DataFrame(
+                    [{grid_id_col: 1, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}]
+                )
+            if len(obj) == 4:
+                sid, lat, lon, alt = obj
+                return pd.DataFrame(
+                    [{grid_id_col: sid, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}]
+                )
+            raise TypeError(
+                "Unsupported tuple format for `points`. "
+                "Use (lat, lon, alt) or (station, lat, lon, alt)."
+            )
+
+        # Sequence (list) of dicts or tuples
+        if isinstance(obj, list):
             if len(obj) == 0:
-                raise ValueError("Empty points sequence.")
+                raise ValueError("Empty `points` sequence.")
+
             first = obj[0]
 
             # list of dicts
             if isinstance(first, dict):
-                return pd.DataFrame(obj)
+                rows = []
+                for i, d in enumerate(obj):
+                    dd = dict(d)  # shallow copy
+                    # Auto-assign station if missing
+                    if grid_id_col not in dd:
+                        dd[grid_id_col] = i + 1
+                    rows.append(dd)
+                df = pd.DataFrame(rows)
+                missing = {grid_lat_col, grid_lon_col, grid_alt_col} - set(df.columns)
+                if missing:
+                    raise ValueError(f"Input dict sequence is missing columns: {missing}")
+                return df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
 
             # list of tuples
-            arr = list(obj)
-            # (lat, lon, alt)
-            if len(first) == 3:
-                df = pd.DataFrame(arr, columns=[grid_lat_col, grid_lon_col, grid_alt_col])
-                df.insert(0, grid_id_col, np.arange(1, len(df) + 1))
-                return df
-            # (station, lat, lon, alt)
-            if len(first) == 4:
-                df = pd.DataFrame(arr, columns=[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col])
-                return df
+            if isinstance(first, tuple):
+                # (lat, lon, alt)
+                if len(first) == 3:
+                    df = pd.DataFrame(obj, columns=[grid_lat_col, grid_lon_col, grid_alt_col])
+                    df.insert(0, grid_id_col, np.arange(1, len(df) + 1))
+                    return df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
 
-        # single tuple
-        if isinstance(obj, tuple):
-            if len(obj) == 3:
-                lat, lon, alt = obj
-                return pd.DataFrame([{grid_id_col: 1, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}])
-            if len(obj) == 4:
-                sid, lat, lon, alt = obj
-                return pd.DataFrame([{grid_id_col: sid, grid_lat_col: lat, grid_lon_col: lon, grid_alt_col: alt}])
+                # (station, lat, lon, alt)
+                if len(first) == 4:
+                    df = pd.DataFrame(obj, columns=[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col])
+                    return df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
+
+                raise TypeError(
+                    "Unsupported tuple length in `points` list. "
+                    "Use (lat, lon, alt) or (station, lat, lon, alt)."
+                )
+
+            raise TypeError(
+                "Unsupported element type in `points` list. "
+                "Use dicts or tuples."
+            )
 
         raise TypeError(
-            "Unsupported `points` format. Use DataFrame, dict, "
-            "list[dict], list[(lat,lon,alt)], or list[(station,lat,lon,alt)]."
+            "Unsupported `points` format. Use:\n"
+            "- DataFrame with station/lat/lon/alt columns\n"
+            "- dict or list[dict]\n"
+            "- list[(lat, lon, alt)] or list[(station, lat, lon, alt)]\n"
+            "- single tuple (lat, lon, alt) or (station, lat, lon, alt)."
         )
 
+    # Build a raw DataFrame from the arbitrary input
     df = _as_df(points)
 
     # Coerce dtypes and basic validation
     df = df.copy()
+    # Station ids can be int or string; we keep them as an Index for robustness
     df[grid_id_col] = pd.Index(df[grid_id_col])
+
     for c in (grid_lat_col, grid_lon_col, grid_alt_col):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     if df[[grid_lat_col, grid_lon_col, grid_alt_col]].isna().any().any():
         raise ValueError("Some coordinates could not be converted to numeric (NaN present).")
 
-    # Drop duplicated stations if any
+    # Duplicated station ids are ambiguous and should be rejected
     if df[grid_id_col].duplicated().any():
-        raise ValueError("Duplicated station identifiers in points.")
+        raise ValueError("Duplicated station identifiers in `points`.")
 
     return df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].reset_index(drop=True)
 
@@ -656,8 +855,8 @@ def predict_points_daily_with_global_model(
     ],
     *,
     # persisted artifacts
-    model_path: str = "models/global_rf_model.joblib",
-    meta_path: str = "models/global_rf_model.meta.json",
+    model_path: str = "models/global_rf_target.joblib",
+    meta_path: str = "models/global_rf_target.meta.json",
     # column names for the normalized grid
     grid_id_col: str = "station",
     grid_lat_col: str = "latitude",
@@ -671,43 +870,51 @@ def predict_points_daily_with_global_model(
     # optional output
     out_path: Optional[str] = None,
     parquet_compression: str = "snappy",
-) -> pd.DataFrame:
+) -> Optional[pd.DataFrame]:
     """
-    Predict daily series for one or many arbitrary points using the saved global model.
+    Predict daily series for one or many arbitrary points using the global model.
 
-    This is a convenience wrapper around `predict_grid_daily_with_global_model`
-    that accepts flexible point specifications (DataFrame, dicts, tuples) and
-    returns a long-format DataFrame including coordinates.
+    This is a convenience wrapper around
+    :func:`predict_grid_daily_with_global_model` that accepts flexible
+    point specifications (DataFrame, dicts, tuples) and returns a
+    long-format DataFrame including coordinates.
 
     Parameters
     ----------
-    points
+    points :
         One of:
-        - DataFrame with [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]
-        - dict with those keys
-        - list[dict] with those keys
-        - list[(lat, lon, alt)]   -> station ids auto-assigned 1..N
+
+        - DataFrame with ``[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]``
+        - dict with those keys (if ``grid_id_col`` is missing, it is set
+          to ``1``)
+        - list[dict] with those keys (missing ``grid_id_col`` is
+          auto-assigned)
+        - list[(lat, lon, alt)]  -> station ids auto-assigned 1..N
         - list[(station, lat, lon, alt)]
         - single tuple (lat, lon, alt) or (station, lat, lon, alt)
-    model_path, meta_path
+
+    model_path, meta_path :
         Paths to persisted model and metadata.
-    grid_*_col
+    grid_*_col :
         Column names to use in the normalized grid.
-    start, end
-        Inclusive date span for predictions (YYYY-MM-DD).
-    batch_days
+    start, end :
+        Inclusive date span for predictions (``YYYY-MM-DD``).
+    batch_days :
         Number of days per time-batch (RAM/speed trade-off).
-    out_path
-        Optional parquet path for saving predictions.
-    parquet_compression
+    out_path :
+        Optional parquet path for saving predictions. If provided, the
+        function streams output to disk and returns ``None``.
+    parquet_compression :
         Parquet codec when saving.
 
     Returns
     -------
-    preds : DataFrame
-        Long-format [station, latitude, longitude, altitude, date, y_pred_full].
+    preds : DataFrame or None
+        Long-format predictions table (same as
+        :func:`predict_grid_daily_with_global_model`) or ``None`` when
+        streaming to disk.
     """
-    # normalize inputs to a proper grid dataframe
+    # Normalize inputs to a proper grid dataframe
     grid_df = _normalize_points_to_grid_df(
         points,
         grid_id_col=grid_id_col,
@@ -716,7 +923,7 @@ def predict_points_daily_with_global_model(
         grid_alt_col=grid_alt_col,
     )
 
-    # call the existing grid predictor (which should already include coords in output)
+    # Delegate to the existing grid predictor (which already includes coords)
     preds = predict_grid_daily_with_global_model(
         grid_df=grid_df,
         model_path=model_path,
@@ -740,30 +947,32 @@ def predict_at_point_daily_with_global_model(
     longitude: float,
     altitude: float,
     station: Union[int, str] = 1,
-    model_path: str = "models/global_rf_model.joblib",
-    meta_path: str = "models/global_rf_model.meta.json",
+    model_path: str = "models/global_rf_target.joblib",
+    meta_path: str = "models/global_rf_target.meta.json",
     start: str = "1991-01-01",
     end: str = "2020-12-31",
     batch_days: int = 365,
     out_path: Optional[str] = None,
     parquet_compression: str = "snappy",
-) -> pd.DataFrame:
+) -> Optional[pd.DataFrame]:
     """
-    Predict the daily series at a single point (lat/lon/alt) using the saved global model.
+    Predict the daily series at a single point (lat/lon/alt) using the global model.
 
     Parameters
     ----------
-    latitude, longitude, altitude
+    latitude, longitude, altitude :
         Point coordinates.
-    station
+    station :
         Identifier to assign to this point (default=1).
-    model_path, meta_path, start, end, batch_days, out_path, parquet_compression
-        See `predict_points_daily_with_global_model`.
+    model_path, meta_path, start, end, batch_days, out_path, parquet_compression :
+        See :func:`predict_points_daily_with_global_model`.
 
     Returns
     -------
-    preds : DataFrame
-        Long-format [station, latitude, longitude, altitude, date, y_pred_full].
+    preds : DataFrame or None
+        Long-format table with columns
+        ``[station, latitude, longitude, altitude, date, y_pred_full]``, or
+        ``None`` when streaming to disk.
     """
     pts = [(station, float(latitude), float(longitude), float(altitude))]
     return predict_points_daily_with_global_model(
@@ -776,5 +985,3 @@ def predict_at_point_daily_with_global_model(
         out_path=out_path,
         parquet_compression=parquet_compression,
     )
-
-
