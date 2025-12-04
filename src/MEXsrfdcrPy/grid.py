@@ -1,171 +1,84 @@
-# src/MEXsrfdcrPy/grid.py
 # SPDX-License-Identifier: MIT
 """
-Global grid-based Random Forest utilities for daily climate reconstruction.
+Global grid modelling utilities for MEXsrfdcrPy.
 
-This module provides a small, focused toolkit to train a *single* global
-Random Forest model on a station network and then use it to predict daily
-values at arbitrary locations (points or grids).
+This module provides a high-level API to:
 
-Typical workflow
-----------------
-1. Train a global RF model for a target variable (e.g. daily rainfall):
+- Train a single **global Random Forest** using all stations
+  (`train_global_rf_target`).
+- Apply that model to:
+    * all grid points of a domain
+      (`predict_grid_daily_with_global_model`),
+    * an arbitrary set of points
+      (`predict_points_daily_with_global_model`),
+    * or a single location
+      (`predict_at_point_daily_with_global_model`).
 
-   >>> from MEXsrfdcrPy.grid import train_global_rf_target
-   >>> model_path = "RainfallModel-IMEX_v1.0.0.joblib"
-   >>> meta_path = "RainfallModel-IMEX.meta.json"
-   >>> train_global_rf_target(
-   ...     data=df,
-   ...     start="1991-01-01",
-   ...     end="2020-12-31",
-   ...     min_rows_per_station=3650,
-   ...     target_col="prec",
-   ...     id_col="station",
-   ...     date_col="date",
-   ...     lat_col="latitude",
-   ...     lon_col="longitude",
-   ...     alt_col="altitude",
-   ...     rf_params={"n_estimators": 200, "random_state": 42, "n_jobs": -1},
-   ...     model_path=model_path,
-   ...     meta_path=meta_path,
-   ... )
+The philosophy is the same que en el resto del paquete:
 
-2. Predict at an arbitrary point (used e.g. in Kaggle notebooks):
+- Usar únicamente coordenadas espaciales (lat, lon, alt) +
+  características de calendario (año, mes, día del año) como entrada.
+- Entrenar un único modelo global con todas las estaciones que cumplen
+  un umbral mínimo de datos.
+- Luego, generalizar a cualquier punto / fecha del dominio, produciendo
+  series completas diarias.
 
-   >>> from MEXsrfdcrPy.grid import predict_at_point_daily_with_global_model
-   >>> series = predict_at_point_daily_with_global_model(
-   ...     latitude=21.85,
-   ...     longitude=-102.29,
-   ...     altitude=1890.8,
-   ...     station=1001610,
-   ...     model_path=model_path,
-   ...     meta_path=meta_path,
-   ...     start="1991-01-01",
-   ...     end="2020-12-31",
-   ... )
-   >>> series.head()
+Compatibilidad hacia atrás
+--------------------------
 
-3. Use the RF-based series alongside LOSO-based reconstructions and
-   external products (e.g. NASA) for visual and metric comparison via
-   :func:`MEXsrfdcrPy.pipeline.plot_compare_obs_rf_nasa`.
+Versiones anteriores del paquete guardaban los metadatos del modelo
+global con las claves ``"start"`` y ``"end"``. La clase
+:class:`GlobalRFMeta` implementa un método de clase
+:meth:`GlobalRFMeta.from_dict` que:
 
-Design choices
---------------
-* Inputs are plain pandas DataFrames with canonical column names:
+- Mapea ``start`` → ``train_start`` si no existe.
+- Mapea ``end`` → ``train_end`` si no existe.
+- Ignora silenciosamente claves desconocidas.
 
-  ``station | date | latitude | longitude | altitude | prec | tmin | tmax | evap``
+De esta forma, **los modelos viejos** (por ejemplo los que ya subiste a
+Zenodo/Kaggle) siguen funcionando sin modificar nada del lado del
+usuario.
 
-  These can be customised via function arguments.
-
-* The global RF uses only *static* and *temporal* features:
-
-  ``[lat, lon, alt, year, month, doy]`` plus optional cyclic encodings of
-  day-of-year (``doy_sin, doy_cos``).
-
-* Model and metadata are stored as:
-
-  - a binary ``.joblib`` file (scikit-learn RF object), and
-  - a small JSON sidecar with training meta-information.
-
-* The module is intentionally metric-agnostic: it does **not** compute
-  hydrological scores itself. Users are expected to rely on
-  :mod:`MEXsrfdcrPy.metrics` and, when needed,
-  :func:`MEXsrfdcrPy.pipeline.plot_compare_obs_rf_nasa` for KGE, NSE, etc.
-
-Dependencies
+Dependencias
 ------------
-Core:
-    - numpy
-    - pandas
-    - scikit-learn
-    - joblib
 
-Optional:
-    - nothing else; plotting and LOSO logic live in :mod:`pipeline`.
+- numpy
+- pandas
+- scikit-learn
+- joblib
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
 
 import json
 import os
 
-import numpy as np
 import pandas as pd
-from joblib import dump as joblib_dump
-from joblib import load as joblib_load
+from joblib import dump as joblib_dump, load as joblib_load
 from sklearn.ensemble import RandomForestRegressor
 
-from .pipeline import add_time_features, ensure_datetime
+from .metrics import regression_metrics
+from .pipeline import ensure_datetime, add_time_features
 
 
 # ---------------------------------------------------------------------
-# Small dataclass for model metadata
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class GlobalRFMeta:
-    """Metadata saved alongside the global Random Forest model.
-
-    Parameters
-    ----------
-    model_type:
-        String identifier for the model (e.g. ``"RandomForestRegressor"``).
-    target_col:
-        Name of the target variable used during training.
-    id_col, date_col, lat_col, lon_col, alt_col:
-        Column names in the original training DataFrame.
-    feature_cols:
-        List of feature column names used to fit the model.
-    add_cyclic:
-        Whether cyclic encodings of day-of-year were used.
-    rf_params:
-        Dictionary of parameters passed to :class:`RandomForestRegressor`.
-    train_start, train_end:
-        String representation of the training period boundaries.
-    n_rows:
-        Number of training rows used.
-    n_stations:
-        Number of stations contributing to the training set.
-    min_rows_per_station:
-        Minimum number of valid rows required per station.
-    """
-
-    model_type: str
-    target_col: str
-    id_col: str
-    date_col: str
-    lat_col: str
-    lon_col: str
-    alt_col: str
-    feature_cols: List[str]
-    add_cyclic: bool
-    rf_params: Dict
-    train_start: str
-    train_end: str
-    n_rows: int
-    n_stations: int
-    min_rows_per_station: int
-
-
-# ---------------------------------------------------------------------
-# Internal helpers
+# Small I/O helpers (local to this module)
 # ---------------------------------------------------------------------
 
 
 def _ensure_parent_dir(path: Optional[str]) -> None:
-    """Create the parent directory for *path* if needed (no-op on None)."""
+    """Create parent directory if needed (no-op on None)."""
     if path is None:
         return
     d = os.path.dirname(str(path)) or "."
     os.makedirs(d, exist_ok=True)
 
 
-def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
-    """Save a JSON-able object to disk in a pretty-printed form."""
+def _save_json(obj: Dict[str, Any], path: Optional[str]) -> Optional[str]:
+    """Save a JSON-serialisable dict to *path* (pretty-printed)."""
     if path is None:
         return None
     _ensure_parent_dir(path)
@@ -174,278 +87,222 @@ def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
     return path
 
 
-def _load_json(path: str) -> dict:
-    """Load JSON from *path* and return the decoded Python object."""
+def _load_json(path: str) -> Dict[str, Any]:
+    """Load a JSON file into a Python dictionary."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 # ---------------------------------------------------------------------
-# Normalisation of "points" into a grid-like DataFrame
+# Metadata for global RF model
 # ---------------------------------------------------------------------
 
 
-def _as_df_from_points(
-    obj: Union[pd.DataFrame, dict, Iterable, np.ndarray],
-    *,
-    grid_id_col: str,
-    grid_lat_col: str,
-    grid_lon_col: str,
-    grid_alt_col: str,
-) -> pd.DataFrame:
+@dataclass
+class GlobalRFMeta:
     """
-    Convert arbitrary *points* specification to a DataFrame.
+    Metadata for a global Random Forest trained with
+    :func:`train_global_rf_target`.
 
-    Accepted formats
-    ----------------
-    * pandas.DataFrame
-        Must already contain at least latitude / longitude columns.
-    * dict
-        Single point, e.g. ``{"latitude": 20.0, "longitude": -100.0, "altitude": 2000.0}``.
-    * tuple of length 2 or 3
-        Interpreted as ``(lat, lon)`` or ``(lat, lon, alt)`` for a single point.
-    * list/tuple of dicts
-        Each dict corresponds to a point.
-    * list/tuple of tuples
-        Each inner tuple is interpreted as ``(lat, lon)`` or ``(lat, lon, alt)``.
-    * NumPy array
-        Shape ``(n, 2)`` or ``(n, 3)`` interpreted as above.
-
-    Any missing altitude values are set to NaN. If the identifier column
-    (``grid_id_col``) is missing, a simple running index (1..n_points) is
-    generated.
-
-    Parameters
-    ----------
-    obj:
-        Input "points" container.
-    grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col:
-        Standardised column names in the output DataFrame.
-
-    Returns
-    -------
-    DataFrame
-        With columns ``[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]``.
+    The class is intentionally simple and JSON-friendly. Use
+    :meth:`from_dict` and :meth:`to_dict` to serialise/deserialise
+    safely, including backwards compatibility with older metadata
+    that used different key names (e.g. ``start`` / ``end``).
     """
-    # Already a DataFrame
-    if isinstance(obj, pd.DataFrame):
-        df = obj.copy()
-    # Single dict
-    elif isinstance(obj, dict):
-        df = pd.DataFrame([obj])
-    # NumPy array
-    elif isinstance(obj, np.ndarray):
-        arr = np.asarray(obj)
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
-        if arr.shape[1] not in (2, 3):
-            raise ValueError("NumPy array 'points' must have shape (n, 2) or (n, 3).")
-        cols = [grid_lat_col, grid_lon_col] + ([grid_alt_col] if arr.shape[1] == 3 else [])
-        df = pd.DataFrame(arr, columns=cols)
-    # Single tuple interpreted as one point
-    elif isinstance(obj, tuple) and not any(
-        isinstance(x, (list, tuple, dict, pd.Series, np.ndarray)) for x in obj
-    ):
-        if len(obj) not in (2, 3):
-            raise ValueError("Single tuple 'points' must have length 2 or 3.")
-        if len(obj) == 2:
-            df = pd.DataFrame(
-                [{grid_lat_col: obj[0], grid_lon_col: obj[1]}],
-            )
-        else:
-            df = pd.DataFrame(
-                [{grid_lat_col: obj[0], grid_lon_col: obj[1], grid_alt_col: obj[2]}],
-            )
-    # Generic list/tuple container
-    elif isinstance(obj, (list, tuple)):
-        if len(obj) == 0:
-            raise ValueError("Empty 'points' sequence.")
-        first = obj[0]
-        # list of dicts
-        if isinstance(first, dict):
-            df = pd.DataFrame(obj)
-        # list of tuples
-        elif isinstance(first, (list, tuple, np.ndarray)):
-            rows = []
-            for t in obj:
-                if len(t) == 2:
-                    rows.append(
-                        {grid_lat_col: t[0], grid_lon_col: t[1]},
-                    )
-                elif len(t) == 3:
-                    rows.append(
-                        {grid_lat_col: t[0], grid_lon_col: t[1], grid_alt_col: t[2]},
-                    )
-                else:
-                    raise ValueError("Tuples in 'points' must have length 2 or 3.")
-            df = pd.DataFrame(rows)
-        else:
-            raise TypeError("Unsupported 'points' element type.")
-    else:
-        raise TypeError("Unsupported 'points' type; use DataFrame, dict, tuple, list or ndarray.")
 
-    # Ensure required columns exist
-    if grid_lat_col not in df.columns or grid_lon_col not in df.columns:
-        raise ValueError(
-            f"Points must include latitude/longitude columns "
-            f"('{grid_lat_col}', '{grid_lon_col}')."
-        )
-    if grid_alt_col not in df.columns:
-        df[grid_alt_col] = np.nan
+    target_col: str
+    id_col: str
+    date_col: str
+    lat_col: str
+    lon_col: str
+    alt_col: str
+    feature_cols: List[str]
+    n_stations: int
+    n_rows: int
+    train_start: str
+    train_end: str
+    rf_params: Dict[str, Any]
+    metrics_daily: Optional[Dict[str, float]] = None
+    metrics_monthly: Optional[Dict[str, float]] = None
+    metrics_annual: Optional[Dict[str, float]] = None
+    version: Optional[str] = None  # optional model version tag
 
-    # Ensure identifier column
-    if grid_id_col not in df.columns:
-        df[grid_id_col] = np.arange(1, len(df) + 1, dtype=int)
+    # ---- Backwards compatibility ------------------------------------
 
-    # Standardise column order
-    df = df[[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
-    return df.reset_index(drop=True)
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GlobalRFMeta":
+        """
+        Build a :class:`GlobalRFMeta` from a raw dictionary, handling
+        older metadata layouts.
 
+        Rules:
+        - If ``train_start`` is missing but ``start`` is present,
+          use ``start`` as ``train_start``.
+        - If ``train_end`` is missing but ``end`` is present,
+          use ``end`` as ``train_end``.
+        - Unknown keys are silently dropped.
+        """
+        d = dict(d)  # shallow copy
 
-def _normalize_points_to_grid_df(
-    points: Union[pd.DataFrame, dict, Iterable, np.ndarray],
-    *,
-    grid_id_col: str = "station",
-    grid_lat_col: str = "latitude",
-    grid_lon_col: str = "longitude",
-    grid_alt_col: str = "altitude",
-) -> pd.DataFrame:
-    """
-    Normalise *points* into a small grid description DataFrame.
+        # Older versions used 'start' / 'end'
+        if "train_start" not in d and "start" in d:
+            d["train_start"] = d.pop("start")
+        if "train_end" not in d and "end" in d:
+            d["train_end"] = d.pop("end")
 
-    This is a thin wrapper around :func:`_as_df_from_points` and is the
-    internal entry point used by prediction helpers.
+        allowed = set(cls.__dataclass_fields__.keys())
+        clean = {k: v for k, v in d.items() if k in allowed}
+        return cls(**clean)
 
-    Parameters
-    ----------
-    points:
-        Any of the formats described in :func:`_as_df_from_points`.
-    grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col:
-        Desired column names in the output.
-
-    Returns
-    -------
-    DataFrame
-        With columns ``[grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]``.
-
-    Examples
-    --------
-    Single tuple:
-
-    >>> _normalize_points_to_grid_df((20.0, -100.0, 2000.0))
-       station  latitude  longitude  altitude
-    0        1      20.0     -100.0    2000.0
-
-    Single dict:
-
-    >>> _normalize_points_to_grid_df({"latitude": 20.0, "longitude": -100.0})
-       station  latitude  longitude  altitude
-    0        1      20.0     -100.0       NaN
-    """
-    return _as_df_from_points(
-        points,
-        grid_id_col=grid_id_col,
-        grid_lat_col=grid_lat_col,
-        grid_lon_col=grid_lon_col,
-        grid_alt_col=grid_alt_col,
-    )
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise to a JSON-safe dictionary."""
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------
-# Training a global RF model for a target variable
+# Training: single global RF model
 # ---------------------------------------------------------------------
 
 
 def train_global_rf_target(
     data: pd.DataFrame,
     *,
-    target_col: str = "prec",
     id_col: str = "station",
     date_col: str = "date",
     lat_col: str = "latitude",
     lon_col: str = "longitude",
     alt_col: str = "altitude",
+    target_col: str = "prec",
     start: Optional[str] = None,
     end: Optional[str] = None,
     min_rows_per_station: int = 365,
-    add_cyclic: bool = True,
+    rf_params: Optional[Dict[str, Any]] = None,
+    add_cyclic: bool = False,
     feature_cols: Optional[List[str]] = None,
-    rf_params: Optional[Dict] = None,
     model_path: Optional[str] = None,
     meta_path: Optional[str] = None,
-    save_training_table_path: Optional[str] = None,
-    parquet_compression: str = "snappy",
-) -> Tuple[RandomForestRegressor, GlobalRFMeta, pd.DataFrame]:
+    save_summary_path: Optional[str] = None,
+) -> Tuple[RandomForestRegressor, Dict[str, Any], pd.DataFrame]:
     """
-    Train a *single* global Random Forest model for a given target variable.
+    Train a single global Random Forest model for a given target variable.
 
-    The model is trained on all stations that have at least
-    ``min_rows_per_station`` valid daily records within the selected period.
+    Typical usage
+    -------------
 
-    Features
-    --------
-    By default, the model uses:
+    .. code-block:: python
 
-    * ``[lat_col, lon_col, alt_col, "year", "month", "doy"]``
-    * plus optional ``"doy_sin"``, ``"doy_cos"`` when ``add_cyclic=True``.
+        from MEXsrfdcrPy.grid import train_global_rf_target
 
-    You can override this behaviour by providing an explicit ``feature_cols``
-    list, which must be present in the pre-processed DataFrame after
-    time features are added.
+        model, meta, summary = train_global_rf_target(
+            data,
+            id_col="station",
+            date_col="date",
+            lat_col="latitude",
+            lon_col="longitude",
+            alt_col="altitude",
+            target_col="tmin",
+            start="1991-01-01",
+            end="2020-12-31",
+            min_rows_per_station=1825,
+            rf_params=dict(
+                n_estimators=200,
+                max_depth=None,
+                random_state=42,
+                n_jobs=-1,
+            ),
+            model_path="TemperatureMinModel-IMEX.joblib",
+            meta_path="TemperatureMinModel-IMEX.meta.json",
+        )
 
     Parameters
     ----------
     data:
-        Long-format DataFrame containing the station network.
-    target_col:
-        Name of the target variable (e.g. ``"prec"``, ``"tmin"``).
-    id_col, date_col, lat_col, lon_col, alt_col:
+        Long-format DataFrame containing all stations.
+    id_col, date_col, lat_col, lon_col, alt_col, target_col:
         Column names in *data*.
     start, end:
-        Optional training period boundaries (inclusive).
+        Optional period restriction for training. If any of them is
+        ``None``, the corresponding bound is inferred from the data.
     min_rows_per_station:
-        Minimum number of valid rows (non-NaN target and features) required
+        Minimum number of **non-missing** values required in ``target_col``
         for a station to be included in the training set.
-    add_cyclic:
-        Whether to add cyclic day-of-year encodings.
-    feature_cols:
-        Optional explicit feature list. If ``None``, the default feature
-        set is used.
     rf_params:
-        Parameters passed to :class:`RandomForestRegressor`. If ``None``,
-        a reasonable default is used.
+        Dictionary of parameters passed to
+        :class:`sklearn.ensemble.RandomForestRegressor`. If ``None``,
+        a conservative default is used.
+    add_cyclic:
+        Whether to include sinusoidal encodings ``doy_sin`` / ``doy_cos``
+        of the day-of-year.
+    feature_cols:
+        Optional explicit feature list. If ``None``, the default
+        ``[lat, lon, alt, year, month, doy]`` plus optional cyclic terms
+        is used.
     model_path:
-        Optional path where the trained RF model is saved using joblib.
+        Optional path where the fitted model is serialised via joblib.
     meta_path:
-        Optional path where a JSON sidecar with metadata is written.
-    save_training_table_path:
-        Optional path (CSV/Parquet/Feather) where the final training
-        table is stored for inspection or reproducibility.
-    parquet_compression:
-        Compression codec used when writing Parquet.
+        Optional path where metadata are saved as a JSON file.
+    save_summary_path:
+        Optional CSV/Parquet/Feather path where the per-station training
+        summary table is written.
 
     Returns
     -------
     model:
-        Fitted :class:`RandomForestRegressor` instance.
-    meta:
-        :class:`GlobalRFMeta` object with training metadata.
-    train_df:
-        The DataFrame actually used to train the model.
+        Fitted :class:`RandomForestRegressor`.
+    meta_dict:
+        Metadata dictionary describing the training configuration and
+        model context (this is exactly what is written to *meta_path*).
+    summary:
+        Per-station summary table with basic coverage information.
     """
-    # basic copy + datetime hygiene
-    df = ensure_datetime(data, date_col=date_col)
+    if rf_params is None:
+        rf_params = dict(
+            n_estimators=200,
+            max_depth=None,
+            random_state=42,
+            n_jobs=-1,
+        )
 
-    # optional temporal clipping
+    # 1) Fecha → datetime + recorte de periodo
+    df = ensure_datetime(data, date_col=date_col)
     if start or end:
         lo = pd.to_datetime(start) if start else df[date_col].min()
         hi = pd.to_datetime(end) if end else df[date_col].max()
         df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
 
-    # add time features
-    df = add_time_features(df, date_col=date_col, add_cyclic=add_cyclic)
+    # 2) Resumen por estación (cobertura del target)
+    grp = df.groupby(id_col, dropna=True)
+    coverage_rows = []
+    for st, g in grp:
+        n_total = int(len(g))
+        n_valid = int(g[target_col].notna().sum())
+        cov = float(n_valid) / n_total * 100.0 if n_total > 0 else 0.0
+        coverage_rows.append(
+            {
+                "station": int(st),
+                "n_total": n_total,
+                "n_valid": n_valid,
+                "coverage_pct": cov,
+            }
+        )
+    summary = pd.DataFrame(coverage_rows).sort_values("station").reset_index(drop=True)
 
-    # default features
+    # 3) Filtrar estaciones con umbral mínimo de datos válidos
+    valid_stations = summary.loc[
+        summary["n_valid"] >= int(min_rows_per_station), "station"
+    ].tolist()
+    if not valid_stations:
+        raise ValueError(
+            "No station satisfies min_rows_per_station="
+            f"{min_rows_per_station}. Nothing to train."
+        )
+
+    df_train = df[df[id_col].isin(valid_stations)].copy()
+
+    # 4) Añadir features temporales
+    df_train = add_time_features(df_train, date_col=date_col, add_cyclic=add_cyclic)
+
+    # 5) Definir lista de predictores
     if feature_cols is None:
         feats = [lat_col, lon_col, alt_col, "year", "month", "doy"]
         if add_cyclic:
@@ -453,38 +310,34 @@ def train_global_rf_target(
     else:
         feats = list(feature_cols)
 
-    # validity mask
-    valid_mask = ~df[feats + [target_col]].isna().any(axis=1)
-    df_valid = df.loc[valid_mask].copy()
+    # Asegurar que las columnas existen
+    missing_feats = [c for c in feats if c not in df_train.columns]
+    if missing_feats:
+        raise ValueError(f"Missing feature columns in training data: {missing_feats}")
 
-    # station-level filtering
-    counts = df_valid.groupby(id_col)[target_col].count()
-    keep_ids = counts[counts >= int(min_rows_per_station)].index.tolist()
-    train_df = df_valid[df_valid[id_col].isin(keep_ids)].copy()
+    # 6) Limpiar filas con NaN en features o target
+    mask_valid = ~df_train[feats + [target_col]].isna().any(axis=1)
+    df_train = df_train.loc[mask_valid]
+    if df_train.empty:
+        raise ValueError("Training set is empty after dropping NaNs in features/target.")
 
-    if train_df.empty:
-        raise ValueError(
-            "Training set is empty after applying min_rows_per_station "
-            f"={min_rows_per_station} and validity filters."
-        )
+    # 7) Entrenar RF global
+    X = df_train[feats].to_numpy(copy=False)
+    y = df_train[target_col].to_numpy(copy=False)
+    rf = RandomForestRegressor(**rf_params)
+    rf.fit(X, y)
 
-    # RF parameters
-    if rf_params is None:
-        rf_params = dict(
-            n_estimators=300,
-            max_depth=None,
-            random_state=42,
-            n_jobs=-1,
-        )
+    # 8) Métricas in-sample (solo informativas)
+    y_hat = rf.predict(X)
+    metrics_daily = regression_metrics(y, y_hat)
+    metrics_monthly = None
+    metrics_annual = None  # se podrían añadir, pero no son críticos aquí
 
-    model = RandomForestRegressor(**rf_params)
-    X = train_df[feats].to_numpy(copy=False)
-    y = train_df[target_col].to_numpy(copy=False)
-    model.fit(X, y)
+    # 9) Construir metadatos
+    train_start = str(df_train[date_col].min().date())
+    train_end = str(df_train[date_col].max().date())
 
-    # training metadata
-    meta = GlobalRFMeta(
-        model_type="RandomForestRegressor",
+    meta_obj = GlobalRFMeta(
         target_col=target_col,
         id_col=id_col,
         date_col=date_col,
@@ -492,99 +345,140 @@ def train_global_rf_target(
         lon_col=lon_col,
         alt_col=alt_col,
         feature_cols=feats,
-        add_cyclic=bool(add_cyclic),
-        rf_params=dict(rf_params),
-        train_start=str(start) if start is not None else str(train_df[date_col].min().date()),
-        train_end=str(end) if end is not None else str(train_df[date_col].max().date()),
-        n_rows=int(len(train_df)),
-        n_stations=int(len(keep_ids)),
-        min_rows_per_station=int(min_rows_per_station),
+        n_stations=int(len(valid_stations)),
+        n_rows=int(len(df_train)),
+        train_start=train_start,
+        train_end=train_end,
+        rf_params=rf_params,
+        metrics_daily=metrics_daily,
+        metrics_monthly=metrics_monthly,
+        metrics_annual=metrics_annual,
+        version=None,
     )
+    meta_dict = meta_obj.to_dict()
 
-    # persist model + metadata + training table
+    # 10) Guardar modelo y metadatos si se pidió
     if model_path is not None:
         _ensure_parent_dir(model_path)
-        joblib_dump(model, model_path)
-    if meta_path is not None:
-        _save_json(asdict(meta), meta_path)
+        joblib_dump(rf, model_path)
+    _save_json(meta_dict, meta_path)
 
-    if save_training_table_path is not None:
-        ext = os.path.splitext(save_training_table_path)[1].lower()
-        _ensure_parent_dir(save_training_table_path)
+    # 11) Guardar summary si se pidió
+    if save_summary_path is not None:
+        ext = os.path.splitext(save_summary_path)[1].lower()
+        _ensure_parent_dir(save_summary_path)
         if ext == ".csv":
-            train_df.to_csv(save_training_table_path, index=False)
+            summary.to_csv(save_summary_path, index=False)
         elif ext == ".parquet":
-            train_df.to_parquet(
-                save_training_table_path,
-                index=False,
-                compression=parquet_compression,
-            )
+            summary.to_parquet(save_summary_path, index=False, compression="snappy")
         elif ext == ".feather":
-            train_df.to_feather(save_training_table_path)
+            summary.to_feather(save_summary_path)
         else:
-            raise ValueError("Unsupported extension for save_training_table_path.")
+            raise ValueError(
+                "save_summary_path must have extension .csv, .parquet or .feather"
+            )
 
-    return model, meta, train_df
+    return rf, meta_dict, summary
 
 
 # ---------------------------------------------------------------------
-# Prediction with a pre-trained global model
+# Prediction on arbitrary points (grid or custom)
 # ---------------------------------------------------------------------
+
+
+def _prepare_points(
+    points: pd.DataFrame,
+    *,
+    grid_id_col: str,
+    grid_lat_col: str,
+    grid_lon_col: str,
+    grid_alt_col: str,
+) -> pd.DataFrame:
+    """
+    Validate and normalise the *points* input for prediction.
+
+    The returned DataFrame is a shallow copy with at least the required
+    spatial columns and a unique identifier column.
+    """
+    if points is None or len(points) == 0:
+        raise ValueError("`points` must be a non-empty DataFrame.")
+
+    req = [grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]
+    missing = [c for c in req if c not in points.columns]
+    if missing:
+        raise ValueError(f"Missing required point columns: {missing}")
+
+    out = points.copy()
+    out[grid_id_col] = out[grid_id_col].astype("int64")
+    out[grid_lat_col] = out[grid_lat_col].astype(float)
+    out[grid_lon_col] = out[grid_lon_col].astype(float)
+    out[grid_alt_col] = out[grid_alt_col].astype(float)
+    return out
 
 
 def predict_points_daily_with_global_model(
-    points: Union[pd.DataFrame, dict, Iterable, np.ndarray],
     *,
+    points: pd.DataFrame,
     model_path: str,
     meta_path: str,
-    start: str,
-    end: str,
-    grid_id_col: str = "station",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    grid_id_col: str = "grid_id",
     grid_lat_col: str = "latitude",
     grid_lon_col: str = "longitude",
     grid_alt_col: str = "altitude",
     date_col: str = "date",
 ) -> pd.DataFrame:
     """
-    Predict daily values at one or many points using a pre-trained global RF.
-
-    This is the "grid engine" of the package: it takes arbitrary locations
-    (points or a coarse grid) and produces a daily time series at each
-    location for the requested period.
+    Use a previously trained global RF model to reconstruct daily series
+    for an arbitrary set of points.
 
     Parameters
     ----------
     points:
-        Arbitrary container describing one or more locations. See
-        :func:`_normalize_points_to_grid_df` for accepted formats.
+        DataFrame with at least the columns::
+
+            grid_id_col | grid_lat_col | grid_lon_col | grid_alt_col
+
     model_path:
-        Path to the joblib file containing the trained RF model.
+        Path to the joblib-serialised Random Forest model created by
+        :func:`train_global_rf_target`.
     meta_path:
-        Path to the JSON file with :class:`GlobalRFMeta`-like information.
+        Path to the JSON metadata file created alongside the model.
+        Older metadata files that used ``"start"`` / ``"end"`` are
+        supported transparently.
     start, end:
-        Date range (inclusive) for the predictions.
+        Date range for the reconstructed series. If any of them is
+        ``None``, the bound is taken from the training metadata.
     grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col:
-        Standardised column names in the *output* DataFrame.
+        Column names in *points*.
     date_col:
-        Name of the datetime column in the output.
+        Name used for the date column in the output.
 
     Returns
     -------
     DataFrame
-        With columns::
+        Long-format table with columns::
 
             [date_col, grid_id_col, grid_lat_col, grid_lon_col,
              grid_alt_col, "y_pred_full"]
-
-        sorted by ``(grid_id_col, date_col)``.
     """
-    # load model + metadata
+    # 1) Cargar modelo y metadatos (compatibles hacia atrás)
     model: RandomForestRegressor = joblib_load(model_path)
     meta_dict = _load_json(meta_path)
-    meta = GlobalRFMeta(**meta_dict)
+    meta = GlobalRFMeta.from_dict(meta_dict)
 
-    # normalise points
-    grid_df = _normalize_points_to_grid_df(
+    # 2) Rango de fechas
+    start_eff = pd.to_datetime(start or meta.train_start)
+    end_eff = pd.to_datetime(end or meta.train_end)
+    if end_eff < start_eff:
+        raise ValueError("`end` must be >= `start` (after resolving defaults).")
+
+    dates = pd.date_range(start=start_eff, end=end_eff, freq="D")
+    df_dates = pd.DataFrame({date_col: dates})
+
+    # 3) Normalizar puntos
+    pts = _prepare_points(
         points,
         grid_id_col=grid_id_col,
         grid_lat_col=grid_lat_col,
@@ -592,28 +486,86 @@ def predict_points_daily_with_global_model(
         grid_alt_col=grid_alt_col,
     )
 
-    # build the cartesian product (points × dates)
-    dates = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq="D")
-    pts = grid_df.copy()
-    pts["__key"] = 1
-    dates_df = pd.DataFrame({date_col: dates, "__key": 1})
-    full = pts.merge(dates_df, on="__key").drop(columns="__key")
+    # 4) Producto cartesiano fechas × puntos
+    pts = pts.reset_index(drop=True)
+    pts["_key"] = 1
+    df_dates["_key"] = 1
+    full = df_dates.merge(pts, on="_key").drop(columns="_key")
 
-    # add time features as done in training
-    full = add_time_features(full, date_col=date_col, add_cyclic=meta.add_cyclic)
+    # 5) Añadir features temporales
+    full = add_time_features(full, date_col=date_col, add_cyclic=("doy_sin" in meta.feature_cols))
 
-    # check that all requested features are present
-    missing = set(meta.feature_cols) - set(full.columns)
-    if missing:
-        raise ValueError(f"Missing feature columns for prediction: {missing}")
+    # 6) Predicción
+    missing_feats = [c for c in meta.feature_cols if c not in full.columns]
+    if missing_feats:
+        raise ValueError(
+            f"Missing feature columns in prediction table: {missing_feats}. "
+            "This usually indicates a mismatch between training and prediction inputs."
+        )
 
-    X = full[meta.feature_cols].to_numpy(copy=False)
-    y_hat = model.predict(X)
+    X_pred = full[meta.feature_cols].to_numpy(copy=False)
+    y_pred = model.predict(X_pred)
 
     out = full[[date_col, grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col]].copy()
-    out["y_pred_full"] = y_hat
-    out = out.sort_values([grid_id_col, date_col]).reset_index(drop=True)
-    return out
+    out["y_pred_full"] = y_pred.astype(float)
+
+    return out.sort_values([grid_id_col, date_col]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------
+# Prediction on a pre-defined grid
+# ---------------------------------------------------------------------
+
+
+def predict_grid_daily_with_global_model(
+    grid: pd.DataFrame,
+    *,
+    model_path: str,
+    meta_path: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    grid_id_col: str = "grid_id",
+    grid_lat_col: str = "latitude",
+    grid_lon_col: str = "longitude",
+    grid_alt_col: str = "altitude",
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """
+    Convenience wrapper around
+    :func:`predict_points_daily_with_global_model` for a regular grid.
+
+    Parameters
+    ----------
+    grid:
+        DataFrame describing the spatial grid, with columns::
+
+            grid_id_col | grid_lat_col | grid_lon_col | grid_alt_col
+
+    model_path, meta_path, start, end, grid_*_col, date_col:
+        See :func:`predict_points_daily_with_global_model`.
+
+    Returns
+    -------
+    DataFrame
+        Same format as :func:`predict_points_daily_with_global_model`.
+    """
+    return predict_points_daily_with_global_model(
+        points=grid,
+        model_path=model_path,
+        meta_path=meta_path,
+        start=start,
+        end=end,
+        grid_id_col=grid_id_col,
+        grid_lat_col=grid_lat_col,
+        grid_lon_col=grid_lon_col,
+        grid_alt_col=grid_alt_col,
+        date_col=date_col,
+    )
+
+
+# ---------------------------------------------------------------------
+# Prediction at a single point
+# ---------------------------------------------------------------------
 
 
 def predict_at_point_daily_with_global_model(
@@ -624,53 +576,50 @@ def predict_at_point_daily_with_global_model(
     station: Optional[int] = None,
     model_path: str,
     meta_path: str,
-    start: str,
-    end: str,
-    grid_id_col: str = "station",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    grid_id_col: str = "grid_id",
     grid_lat_col: str = "latitude",
     grid_lon_col: str = "longitude",
     grid_alt_col: str = "altitude",
     date_col: str = "date",
 ) -> pd.DataFrame:
     """
-    Convenience wrapper for :func:`predict_points_daily_with_global_model`
-    for a *single* point.
+    Predict the full daily series at a single location using a trained
+    global RF model.
 
-    This is the function typically used in Kaggle notebooks where a user
-    wants to compare a grid-based RF model against a particular station
-    (using coordinates provided by e.g. SMN).
+    This is a thin wrapper over
+    :func:`predict_points_daily_with_global_model`.
 
     Parameters
     ----------
     latitude, longitude, altitude:
-        Coordinates of the prediction point.
+        Spatial coordinates of the point.
     station:
-        Optional numeric station identifier, used to populate the
-        ``grid_id_col`` column. If ``None``, a simple ID of 1 is used.
-    model_path, meta_path:
-        Paths to the RF model and JSON metadata files.
-    start, end:
-        Start and end dates (inclusive) for the prediction period.
-    grid_id_col, grid_lat_col, grid_lon_col, grid_alt_col, date_col:
-        Column names in the output.
+        Optional numeric identifier to be used as the grid ID. If
+        ``None``, the ID is set to 0.
+    model_path, meta_path, start, end, grid_*_col, date_col:
+        See :func:`predict_points_daily_with_global_model`.
 
     Returns
     -------
     DataFrame
-        Daily time series for the requested period at the given point,
-        with the same structure as the output of
-        :func:`predict_points_daily_with_global_model`.
+        Same format as :func:`predict_points_daily_with_global_model`,
+        but restricted to a single grid ID.
     """
-    point: Dict[str, float] = {
-        grid_lat_col: float(latitude),
-        grid_lon_col: float(longitude),
-        grid_alt_col: float(altitude),
-    }
-    if station is not None:
-        point[grid_id_col] = int(station)
+    gid = int(station) if station is not None else 0
+
+    pts = pd.DataFrame(
+        {
+            grid_id_col: [gid],
+            grid_lat_col: [float(latitude)],
+            grid_lon_col: [float(longitude)],
+            grid_alt_col: [float(altitude)],
+        }
+    )
 
     out = predict_points_daily_with_global_model(
-        points=point,
+        points=pts,
         model_path=model_path,
         meta_path=meta_path,
         start=start,
@@ -692,6 +641,6 @@ __all__ = [
     "GlobalRFMeta",
     "train_global_rf_target",
     "predict_points_daily_with_global_model",
+    "predict_grid_daily_with_global_model",
     "predict_at_point_daily_with_global_model",
-    "_normalize_points_to_grid_df",
 ]
