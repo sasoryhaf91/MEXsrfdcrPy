@@ -1,412 +1,340 @@
+# tests/test_grid.py
+# SPDX-License-Identifier: MIT
+"""
+Tests for MEXsrfdcrPy.grid
+
+These tests focus on:
+- Normalisation of point specifications into a grid DataFrame.
+- Training a global Random Forest model for a target variable.
+- Daily prediction at arbitrary points (single and multiple) using the
+  trained global model.
+"""
+
+from __future__ import annotations
+
 import os
-from typing import List
 
 import numpy as np
 import pandas as pd
 
 from MEXsrfdcrPy.grid import (
-    GlobalModelMeta,
-    train_global_rf_target,
-    predict_grid_daily_with_global_model,
-    slice_station_series,
-    grid_nan_report,
-    predict_points_daily_with_global_model,
+    GlobalRFMeta,
+    _normalize_points_to_grid_df,
     predict_at_point_daily_with_global_model,
+    predict_points_daily_with_global_model,
+    train_global_rf_target,
 )
-
-# NOTE: _normalize_points_to_grid_df is internal but we test it explicitly
-from MEXsrfdcrPy.grid import _normalize_points_to_grid_df  # type: ignore
 
 
 # ---------------------------------------------------------------------
-# Small synthetic helpers
+# Synthetic data helpers
 # ---------------------------------------------------------------------
 
 
 def _make_synthetic_training_df(
     n_stations: int = 3,
+    n_days: int = 30,
     start: str = "2000-01-01",
-    end: str = "2000-01-10",
+    target_col: str = "prec",
 ) -> pd.DataFrame:
     """
-    Build a small synthetic training dataset for grid tests.
+    Create a small synthetic daily dataset for multiple stations.
 
-    The "prec" target is a simple deterministic function of coordinates
-    and day-of-year; we do not enforce any accuracy in the tests, only
-    that the pipeline runs and returns finite values.
+    The target variable is a simple linear trend plus station-specific
+    offsets and Gaussian noise.
     """
-    dates = pd.date_range(start, end, freq="D")
-    rows: List[dict] = []
-
-    # Simple lat/lon/alt pattern
-    base_lat = 20.0
-    base_lon = -100.0
-    base_alt = 2000.0
-
-    for sid in range(1, n_stations + 1):
-        lat = base_lat + sid * 0.5
-        lon = base_lon - sid * 0.5
-        alt = base_alt + sid * 10.0
-        for d in dates:
-            # simple synthetic target: depends on station and doy
-            doy = d.timetuple().tm_yday
-            prec = 1.0 * sid + 0.01 * doy
+    dates = pd.date_range(start, periods=n_days, freq="D")
+    rng = np.random.RandomState(0)
+    rows = []
+    for st in range(1, n_stations + 1):
+        lat = 20.0 + 0.5 * st
+        lon = -100.0 - 0.5 * st
+        alt = 2000.0 + 10.0 * st
+        noise = rng.normal(scale=1.0, size=len(dates))
+        values = 10.0 + 0.1 * st + 0.01 * np.arange(len(dates), dtype=float) + noise
+        for d, v in zip(dates, values):
             rows.append(
                 {
-                    "station": sid,
+                    "station": st,
                     "date": d,
                     "latitude": lat,
                     "longitude": lon,
                     "altitude": alt,
-                    "prec": prec,
+                    target_col: v,
                 }
             )
-
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------
-# GlobalModelMeta tests
+# Tests for _normalize_points_to_grid_df
 # ---------------------------------------------------------------------
-
-
-def test_global_model_meta_roundtrip(tmp_path):
-    """GlobalModelMeta.save/load should preserve all fields."""
-    meta = GlobalModelMeta(
-        id_col="station",
-        date_col="date",
-        lat_col="latitude",
-        lon_col="longitude",
-        alt_col="altitude",
-        target_col="prec",
-        start="1991-01-01",
-        end="2020-12-31",
-        min_rows_per_station=100,
-        add_cyclic=True,
-        rf_params={"n_estimators": 10, "random_state": 0},
-        features=["latitude", "longitude", "altitude", "year"],
-        n_train_rows=1234,
-        n_stations_used=10,
-        stations_used_sorted=[1, 2, 3],
-    )
-
-    path = tmp_path / "meta.json"
-    meta.save(str(path))
-    assert path.exists()
-
-    loaded = GlobalModelMeta.load(str(path))
-    assert loaded == meta
-    assert loaded.features == ["latitude", "longitude", "altitude", "year"]
-    assert loaded.stations_used_sorted == [1, 2, 3]
-
-
-# ---------------------------------------------------------------------
-# Training tests
-# ---------------------------------------------------------------------
-
-
-def test_train_global_rf_target_returns_expected_types_and_summary(tmp_path):
-    """train_global_rf_target should return model, metadata and a non-empty summary."""
-    df = _make_synthetic_training_df()
-    model_path = tmp_path / "global_rf.joblib"
-    meta_path = tmp_path / "global_rf.meta.json"
-
-    model, meta, summary = train_global_rf_target(
-        data=df,
-        id_col="station",
-        date_col="date",
-        lat_col="latitude",
-        lon_col="longitude",
-        alt_col="altitude",
-        target_col="prec",
-        start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=5,
-        add_cyclic=True,
-        extra_feature_cols=None,
-        rf_params={"n_estimators": 10, "random_state": 0, "n_jobs": -1},
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-    )
-
-    # Types and artifacts
-    assert model_path.exists()
-    assert meta_path.exists()
-    assert isinstance(meta, GlobalModelMeta)
-    assert isinstance(summary, pd.DataFrame)
-    assert not summary.empty
-
-    # Metadata consistency
-    assert meta.id_col == "station"
-    assert meta.target_col == "prec"
-    assert meta.min_rows_per_station == 5
-    assert meta.n_stations_used == len(summary)
-    assert meta.n_train_rows > 0
-    assert set(summary["station"].astype(int)) == set(meta.stations_used_sorted)
-
-
-def test_train_global_rf_target_respects_min_rows_per_station(tmp_path):
-    """Stations with too few valid rows should be excluded."""
-    df = _make_synthetic_training_df(n_stations=2)
-    # Drop many rows for station 2 to make it fall below the threshold
-    df = df[~((df["station"] == 2) & (df["date"] > "2000-01-03"))].copy()
-
-    model_path = tmp_path / "global_rf.joblib"
-    meta_path = tmp_path / "global_rf.meta.json"
-
-    _, meta, summary = train_global_rf_target(
-        data=df,
-        id_col="station",
-        date_col="date",
-        lat_col="latitude",
-        lon_col="longitude",
-        alt_col="altitude",
-        target_col="prec",
-        start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=7,  # station 2 should not reach this
-        rf_params={"n_estimators": 5, "random_state": 0, "n_jobs": -1},
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-    )
-
-    assert set(summary["station"].astype(int)) == {1}
-    assert meta.n_stations_used == 1
-    assert meta.stations_used_sorted == [1]
-
-
-# ---------------------------------------------------------------------
-# Grid prediction tests
-# ---------------------------------------------------------------------
-
-
-def test_predict_grid_daily_with_global_model_returns_expected_shape(tmp_path):
-    """
-    Predicting on a small grid should return (n_stations * n_days) rows
-    with the expected columns and finite predictions.
-    """
-    df = _make_synthetic_training_df(n_stations=3)
-    model_path = tmp_path / "global_rf.joblib"
-    meta_path = tmp_path / "global_rf.meta.json"
-
-    # Train
-    train_global_rf_target(
-        data=df,
-        start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=5,
-        rf_params={"n_estimators": 10, "random_state": 0, "n_jobs": -1},
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-    )
-
-    # Build grid from unique station coordinates
-    grid = (
-        df[["station", "latitude", "longitude", "altitude"]]
-        .drop_duplicates("station")
-        .reset_index(drop=True)
-    )
-
-    preds = predict_grid_daily_with_global_model(
-        grid_df=grid,
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-        grid_id_col="station",
-        grid_lat_col="latitude",
-        grid_lon_col="longitude",
-        grid_alt_col="altitude",
-        start="2000-01-01",
-        end="2000-01-10",
-        batch_days=5,
-        out_path=None,
-    )
-
-    assert isinstance(preds, pd.DataFrame)
-    assert not preds.empty
-
-    n_days = len(pd.date_range("2000-01-01", "2000-01-10", freq="D"))
-    n_stations = grid["station"].nunique()
-    assert len(preds) == n_days * n_stations
-
-    expected_cols = ["station", "date", "latitude", "longitude", "altitude", "y_pred_full"]
-    assert list(preds.columns) == expected_cols
-
-    assert preds["y_pred_full"].notna().all()
-    assert np.isfinite(preds["y_pred_full"]).all()
-
-
-def test_predict_grid_daily_with_global_model_streams_to_parquet(tmp_path):
-    """When out_path is provided, predictions should be written to Parquet and return None."""
-    df = _make_synthetic_training_df(n_stations=2)
-    model_path = tmp_path / "global_rf.joblib"
-    meta_path = tmp_path / "global_rf.meta.json"
-
-    train_global_rf_target(
-        data=df,
-        start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=5,
-        rf_params={"n_estimators": 5, "random_state": 0, "n_jobs": -1},
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-    )
-
-    grid = (
-        df[["station", "latitude", "longitude", "altitude"]]
-        .drop_duplicates("station")
-        .reset_index(drop=True)
-    )
-
-    out_path = tmp_path / "grid_preds.parquet"
-    result = predict_grid_daily_with_global_model(
-        grid_df=grid,
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-        start="2000-01-01",
-        end="2000-01-10",
-        out_path=str(out_path),
-    )
-
-    assert result is None
-    assert out_path.exists()
-    # Basic sanity check: file is non-empty
-    assert os.path.getsize(out_path) > 0
-
-
-# ---------------------------------------------------------------------
-# Convenience utilities
-# ---------------------------------------------------------------------
-
-
-def test_slice_station_series_filters_and_sorts():
-    """slice_station_series should return only the requested station, sorted by date."""
-    df = _make_synthetic_training_df(n_stations=2)
-    # Fake predictions reuse "prec" as y_pred_full
-    df_pred = df.rename(columns={"prec": "y_pred_full"})[
-        ["station", "date", "latitude", "longitude", "altitude", "y_pred_full"]
-    ].copy()
-
-    sid = 1
-    sub = slice_station_series(df_pred, station_id=sid, id_col="station", date_col="date")
-
-    assert not sub.empty
-    assert (sub["station"].astype(int).unique() == np.array([sid])).all()
-    # Dates must be sorted
-    assert sub["date"].is_monotonic_increasing
-
-
-def test_grid_nan_report_counts_missing_values():
-    """grid_nan_report should count missing values per required column."""
-    grid = pd.DataFrame(
-        {
-            "station": [1, 2, None],
-            "latitude": [19.0, None, 21.0],
-            "longitude": [-99.0, -98.0, None],
-            "altitude": [2200.0, 2300.0, 2400.0],
-        }
-    )
-
-    report = grid_nan_report(grid)
-    assert report.shape == (1, 4)
-
-    row = report.iloc[0]
-    assert row["station"] == 1  # one NaN
-    assert row["latitude"] == 1
-    assert row["longitude"] == 1
-    assert row["altitude"] == 0
-
-
-# ---------------------------------------------------------------------
-# _normalize_points_to_grid_df tests
-# ---------------------------------------------------------------------
-
-
-def test_normalize_points_from_dataframe():
-    """_normalize_points_to_grid_df should work with a DataFrame input."""
-    df = pd.DataFrame(
-        {
-            "station": [1, 2],
-            "latitude": [20.0, 21.0],
-            "longitude": [-100.0, -101.0],
-            "altitude": [2000.0, 2100.0],
-        }
-    )
-    out = _normalize_points_to_grid_df(df)
-    assert list(out.columns) == ["station", "latitude", "longitude", "altitude"]
-    assert len(out) == 2
-
-
-def test_normalize_points_from_dict_and_list_dicts():
-    """_normalize_points_to_grid_df should accept dict and list[dict]."""
-    single = {"station": 1, "latitude": 20.0, "longitude": -100.0, "altitude": 2000.0}
-    out_single = _normalize_points_to_grid_df(single)
-    assert len(out_single) == 1
-    assert out_single["station"].iloc[0] == 1
-
-    many = [
-        {"station": 1, "latitude": 20.0, "longitude": -100.0, "altitude": 2000.0},
-        {"station": 2, "latitude": 21.0, "longitude": -101.0, "altitude": 2100.0},
-    ]
-    out_many = _normalize_points_to_grid_df(many)
-    assert len(out_many) == 2
-    assert set(out_many["station"]) == {1, 2}
-
-
-def test_normalize_points_from_tuples_lat_lon_alt_and_station_lat_lon_alt():
-    """_normalize_points_to_grid_df should accept tuples with or without station id."""
-    pts_3 = [(20.0, -100.0, 2000.0), (21.0, -101.0, 2100.0)]
-    out_3 = _normalize_points_to_grid_df(pts_3)
-    assert len(out_3) == 2
-    # station ids auto-assigned as 1..N
-    assert list(out_3["station"]) == [1, 2]
-
-    pts_4 = [(10, 20.0, -100.0, 2000.0), (11, 21.0, -101.0, 2100.0)]
-    out_4 = _normalize_points_to_grid_df(pts_4)
-    assert len(out_4) == 2
-    assert set(out_4["station"]) == {10, 11}
 
 
 def test_normalize_points_from_single_tuple():
-    """_normalize_points_to_grid_df should accept a single tuple."""
-    out_3 = _normalize_points_to_grid_df((20.0, -100.0, 2000.0))
-    assert len(out_3) == 1
-    assert out_3["station"].iloc[0] == 1
+    """
+    _normalize_points_to_grid_df should accept a single tuple (lat, lon, alt).
+    """
+    out = _normalize_points_to_grid_df((20.0, -100.0, 2000.0))
+    assert isinstance(out, pd.DataFrame)
+    assert len(out) == 1
+    assert set(out.columns) == {"station", "latitude", "longitude", "altitude"}
+    assert out["latitude"].iloc[0] == 20.0
+    assert out["longitude"].iloc[0] == -100.0
+    assert out["altitude"].iloc[0] == 2000.0
+    # A synthetic station ID is created when not provided
+    assert out["station"].iloc[0] == 1
 
-    out_4 = _normalize_points_to_grid_df((5, 21.0, -101.0, 2100.0))
-    assert len(out_4) == 1
-    assert out_4["station"].iloc[0] == 5
+
+def test_normalize_points_from_dict_without_station():
+    """
+    _normalize_points_to_grid_df should accept a single dict without station ID
+    and generate a simple running index (1..n).
+    """
+    pt = {"latitude": 19.5, "longitude": -99.5, "altitude": 2250.0}
+    out = _normalize_points_to_grid_df(pt)
+    assert len(out) == 1
+    assert out["latitude"].iloc[0] == 19.5
+    assert out["longitude"].iloc[0] == -99.5
+    assert out["altitude"].iloc[0] == 2250.0
+    assert out["station"].iloc[0] == 1
+
+
+def test_normalize_points_from_dataframe_preserves_station_ids():
+    """
+    _normalize_points_to_grid_df should preserve an existing station column.
+    """
+    df = pd.DataFrame(
+        {
+            "station": [100, 101],
+            "latitude": [19.0, 19.1],
+            "longitude": [-99.0, -99.1],
+            "altitude": [2300.0, 2310.0],
+        }
+    )
+    out = _normalize_points_to_grid_df(df)
+    assert len(out) == 2
+    assert out["station"].tolist() == [100, 101]
+    assert np.allclose(out["latitude"], [19.0, 19.1])
+    assert np.allclose(out["longitude"], [-99.0, -99.1])
+    assert np.allclose(out["altitude"], [2300.0, 2310.0])
+
+
+def test_normalize_points_from_numpy_array():
+    """
+    _normalize_points_to_grid_df should accept a NumPy array of shape (n, 3).
+    """
+    arr = np.array([[20.0, -100.0, 2000.0], [21.0, -101.0, 2100.0]])
+    out = _normalize_points_to_grid_df(arr)
+    assert len(out) == 2
+    assert set(out.columns) == {"station", "latitude", "longitude", "altitude"}
+    # Synthetic station IDs should be 1..n
+    assert out["station"].tolist() == [1, 2]
 
 
 # ---------------------------------------------------------------------
-# predict_points* helpers
+# Tests for train_global_rf_target
 # ---------------------------------------------------------------------
 
 
-def test_predict_points_daily_with_global_model_single_point(tmp_path):
-    """predict_points_daily_with_global_model should work for a single point."""
-    df = _make_synthetic_training_df(n_stations=3)
+def test_train_global_rf_target_returns_model_and_meta(tmp_path):
+    """
+    train_global_rf_target should fit a RF model and return a GlobalRFMeta.
+    """
+    df = _make_synthetic_training_df(n_stations=3, n_days=30)
+    model_path = tmp_path / "global_rf.joblib"
+    meta_path = tmp_path / "global_rf.meta.json"
+    train_table_path = tmp_path / "global_rf_train.parquet"
+
+    model, meta, train_df = train_global_rf_target(
+        data=df,
+        target_col="prec",
+        id_col="station",
+        date_col="date",
+        lat_col="latitude",
+        lon_col="longitude",
+        alt_col="altitude",
+        start="2000-01-01",
+        end="2000-01-30",
+        min_rows_per_station=10,
+        add_cyclic=True,
+        rf_params={"n_estimators": 10, "random_state": 0, "n_jobs": -1},
+        model_path=str(model_path),
+        meta_path=str(meta_path),
+        save_training_table_path=str(train_table_path),
+    )
+
+    # Basic checks on outputs
+    from sklearn.ensemble import RandomForestRegressor
+
+    assert isinstance(model, RandomForestRegressor)
+    assert isinstance(meta, GlobalRFMeta)
+    assert isinstance(train_df, pd.DataFrame)
+    assert not train_df.empty
+
+    # Metadata consistency
+    assert meta.target_col == "prec"
+    assert meta.n_stations == 3
+    assert meta.n_rows == len(train_df)
+    assert meta.min_rows_per_station == 10
+    assert "latitude" in meta.feature_cols
+    assert "year" in meta.feature_cols
+
+    # Files should have been written
+    assert os.path.exists(model_path)
+    assert os.path.exists(meta_path)
+    assert os.path.exists(train_table_path)
+
+
+def test_train_global_rf_target_respects_min_rows_per_station():
+    """
+    Stations with fewer than min_rows_per_station valid rows should be
+    excluded from the training set.
+    """
+    # Build a dataset where station 1 has 30 days, station 2 has 5 days
+    full = _make_synthetic_training_df(n_stations=2, n_days=30)
+    # Keep only 5 days for station 2
+    mask_s2 = (full["station"] == 2) & (full["date"] >= "2000-01-01") & (
+        full["date"] <= "2000-01-05"
+    )
+    df = pd.concat(
+        [full[full["station"] == 1], full[mask_s2]],
+        axis=0,
+        ignore_index=True,
+    )
+
+    model, meta, train_df = train_global_rf_target(
+        data=df,
+        target_col="prec",
+        id_col="station",
+        date_col="date",
+        lat_col="latitude",
+        lon_col="longitude",
+        alt_col="altitude",
+        start="2000-01-01",
+        end="2000-01-30",
+        min_rows_per_station=10,
+        add_cyclic=False,
+        rf_params={"n_estimators": 5, "random_state": 0, "n_jobs": -1},
+        model_path=None,
+        meta_path=None,
+        save_training_table_path=None,
+    )
+
+    # Only station 1 should be kept
+    assert sorted(train_df["station"].unique().tolist()) == [1]
+    assert meta.n_stations == 1
+    assert meta.min_rows_per_station == 10
+
+
+# ---------------------------------------------------------------------
+# Tests for predictions with a global model
+# ---------------------------------------------------------------------
+
+
+def test_predict_points_daily_with_global_model_multiple_points(tmp_path):
+    """
+    predict_points_daily_with_global_model should work for multiple points.
+    """
+    df = _make_synthetic_training_df(n_stations=3, n_days=20)
     model_path = tmp_path / "global_rf.joblib"
     meta_path = tmp_path / "global_rf.meta.json"
 
-    train_global_rf_target(
+    # Train a small model
+    _, meta, _ = train_global_rf_target(
         data=df,
+        target_col="prec",
+        id_col="station",
+        date_col="date",
+        lat_col="latitude",
+        lon_col="longitude",
+        alt_col="altitude",
         start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=5,
+        end="2000-01-20",
+        min_rows_per_station=10,
+        add_cyclic=True,
         rf_params={"n_estimators": 10, "random_state": 0, "n_jobs": -1},
         model_path=str(model_path),
         meta_path=str(meta_path),
     )
 
-    # Take the coordinates of station 1 as a "point"
-    st1 = (
-        df[df["station"] == 1][["latitude", "longitude", "altitude"]]
-        .iloc[0]
-        .to_dict()
+    # Two arbitrary points
+    points = pd.DataFrame(
+        {
+            "station": [1000, 1001],
+            "latitude": [21.0, 22.0],
+            "longitude": [-101.0, -102.0],
+            "altitude": [1900.0, 1950.0],
+        }
     )
-    # Use dict format
+
     preds = predict_points_daily_with_global_model(
-        st1,
+        points,
+        model_path=str(model_path),
+        meta_path=str(meta_path),
+        start="2000-01-01",
+        end="2000-01-05",
+    )
+
+    # 5 days × 2 points = 10 rows
+    assert isinstance(preds, pd.DataFrame)
+    assert len(preds) == 10
+    assert set(preds.columns) == {
+        "date",
+        "station",
+        "latitude",
+        "longitude",
+        "altitude",
+        "y_pred_full",
+    }
+    assert sorted(preds["station"].unique().tolist()) == [1000, 1001]
+    assert preds["y_pred_full"].notna().all()
+
+    # Date range check
+    dates = preds["date"].sort_values().unique()
+    assert dates[0] == pd.Timestamp("2000-01-01")
+    assert dates[-1] == pd.Timestamp("2000-01-05")
+
+
+def test_predict_at_point_daily_with_global_model_single_point(tmp_path):
+    """
+    predict_at_point_daily_with_global_model should work for a single point
+    and produce a coherent daily time series.
+    """
+    df = _make_synthetic_training_df(n_stations=3, n_days=15)
+    model_path = tmp_path / "global_rf.joblib"
+    meta_path = tmp_path / "global_rf.meta.json"
+
+    # Train a small model
+    _, meta, _ = train_global_rf_target(
+        data=df,
+        target_col="prec",
+        id_col="station",
+        date_col="date",
+        lat_col="latitude",
+        lon_col="longitude",
+        alt_col="altitude",
+        start="2000-01-01",
+        end="2000-01-15",
+        min_rows_per_station=10,
+        add_cyclic=True,
+        rf_params={"n_estimators": 10, "random_state": 0, "n_jobs": -1},
+        model_path=str(model_path),
+        meta_path=str(meta_path),
+    )
+
+    # Use coordinates of station 1 as a "point"
+    st1 = df[df["station"] == 1].iloc[0]
+    latitude = float(st1["latitude"])
+    longitude = float(st1["longitude"])
+    altitude = float(st1["altitude"])
+    station_id = 9999
+
+    preds = predict_at_point_daily_with_global_model(
+        latitude=latitude,
+        longitude=longitude,
+        altitude=altitude,
+        station=station_id,
         model_path=str(model_path),
         meta_path=str(meta_path),
         start="2000-01-01",
@@ -414,49 +342,21 @@ def test_predict_points_daily_with_global_model_single_point(tmp_path):
     )
 
     assert isinstance(preds, pd.DataFrame)
-    assert not preds.empty
-
-    n_days = len(pd.date_range("2000-01-01", "2000-01-05", freq="D"))
-    assert len(preds) == n_days
-
-    expected_cols = ["station", "date", "latitude", "longitude", "altitude", "y_pred_full"]
-    assert list(preds.columns) == expected_cols
+    assert len(preds) == 5
+    assert set(preds.columns) == {
+        "date",
+        "station",
+        "latitude",
+        "longitude",
+        "altitude",
+        "y_pred_full",
+    }
+    assert preds["station"].nunique() == 1
+    assert preds["station"].iloc[0] == station_id
     assert preds["y_pred_full"].notna().all()
 
+    # Date range check
+    dates = preds["date"].sort_values().unique()
+    assert dates[0] == pd.Timestamp("2000-01-01")
+    assert dates[-1] == pd.Timestamp("2000-01-05")
 
-def test_predict_at_point_daily_with_global_model_single_point(tmp_path):
-    """predict_at_point_daily_with_global_model should run end-to-end for one point."""
-    df = _make_synthetic_training_df(n_stations=2)
-    model_path = tmp_path / "global_rf.joblib"
-    meta_path = tmp_path / "global_rf.meta.json"
-
-    train_global_rf_target(
-        data=df,
-        start="2000-01-01",
-        end="2000-01-10",
-        min_rows_per_station=5,
-        rf_params={"n_estimators": 5, "random_state": 0, "n_jobs": -1},
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-    )
-
-    # Use arbitrary coordinates (taken from station 1)
-    st1 = df[df["station"] == 1].iloc[0]
-    preds = predict_at_point_daily_with_global_model(
-        latitude=float(st1["latitude"]),
-        longitude=float(st1["longitude"]),
-        altitude=float(st1["altitude"]),
-        station=99,
-        model_path=str(model_path),
-        meta_path=str(meta_path),
-        start="2000-01-01",
-        end="2000-01-03",
-    )
-
-    assert isinstance(preds, pd.DataFrame)
-    assert not preds.empty
-
-    n_days = len(pd.date_range("2000-01-01", "2000-01-03", freq="D"))
-    assert len(preds) == n_days
-    assert set(preds["station"]) == {99}
-    assert preds["y_pred_full"].notna().all()

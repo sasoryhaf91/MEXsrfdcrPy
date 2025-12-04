@@ -2,7 +2,8 @@
 """
 High-level pipeline utilities for LOSO-based climate reconstruction.
 
-This module complements :mod:`loso`-style workflows with end-to-end helpers:
+This module implements end-to-end helpers around spatial Random Forest
+models for daily climate reconstruction:
 
 - Station selection and neighbor discovery (KDTree-based).
 - One-pass pre-processing for Leave-One-Station-Out (LOSO) evaluation.
@@ -25,8 +26,10 @@ which returns a consistent dictionary with the keys
 
 ``"MAE"``, ``"RMSE"``, ``"R2"``, ``"KGE"`` and ``"NSE"``.
 
-This makes it straightforward to compare different model configurations at
-daily, monthly and annual aggregation scales.
+In this package, ``R2`` is defined as the **square of the Pearson correlation
+coefficient** between observations and predictions, whereas ``NSE`` is the
+classical Nash–Sutcliffe efficiency. This avoids redundancy between the two
+and follows common practice in hydrology-oriented model evaluation.
 
 Dependencies
 ------------
@@ -943,6 +946,184 @@ def loso_predict_full_series(
     _save_df(full_df, save_series_path, parquet_compression=parquet_compression)
     _save_json(metrics, save_metrics_path)
     return full_df, metrics, model, feature_cols
+
+
+def loso_predict_full_series_neighbors(
+    data: pd.DataFrame,
+    station_id: int,
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    k_neighbors: int = 50,
+    neighbor_map: Optional[Dict[int, List[int]]] = None,
+    rf_params: Dict = dict(
+        n_estimators=200,
+        max_depth=None,
+        random_state=42,
+        n_jobs=-1,
+    ),
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_series_path: Optional[str] = None,
+    save_metrics_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+    """
+    Convenience wrapper for LOSO full-series reconstruction using spatial neighbors.
+
+    This helper mimics the typical workflow of earlier "fast" helpers:
+
+    1. Build (or reuse) a KDTree-based neighbor map.
+    2. Restrict the training pool to the K nearest neighbors of the
+       target station plus the station itself.
+    3. Call :func:`loso_predict_full_series` on this local subset.
+
+    Parameters
+    ----------
+    data:
+        Long-format DataFrame containing all stations.
+    station_id:
+        Station to reconstruct.
+    id_col, date_col, lat_col, lon_col, alt_col, target_col:
+        Column names in *data*.
+    start, end:
+        Date range (inclusive) for the reconstructed series.
+    k_neighbors:
+        Number of spatial neighbors to use for the training pool.
+    neighbor_map:
+        Optional pre-computed neighbor dictionary as returned by
+        :func:`build_station_kneighbors`. If ``None``, it is computed
+        internally from *data*.
+    rf_params, add_cyclic, feature_cols:
+        Passed directly to :func:`loso_predict_full_series`.
+    include_target_pct, include_target_seed:
+        See :func:`sample_target_for_training`.
+    save_series_path, save_metrics_path, parquet_compression:
+        See :func:`loso_predict_full_series`.
+
+    Returns
+    -------
+    full_df:
+        DataFrame with ``[date, station, y_pred_full, y_true]``.
+    metrics:
+        Dictionary with keys ``"daily"``, ``"monthly"``, ``"annual"``.
+    model:
+        Fitted :class:`RandomForestRegressor`.
+    feature_cols:
+        Feature list actually used by the model.
+    """
+    # 1) Neighbor map if not provided
+    if neighbor_map is None:
+        neighbor_map = build_station_kneighbors(
+            data,
+            id_col=id_col,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            k=k_neighbors,
+        )
+
+    # 2) Local subset = neighbors + target
+    neigh_ids = neighbor_map.get(station_id, [])
+    local_ids = neigh_ids + [station_id]
+    data_local = data[data[id_col].isin(local_ids)].copy()
+
+    # 3) Delegate to the core full-series function
+    return loso_predict_full_series(
+        data_local,
+        station_id=station_id,
+        id_col=id_col,
+        date_col=date_col,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        alt_col=alt_col,
+        target_col=target_col,
+        start=start,
+        end=end,
+        rf_params=rf_params,
+        add_cyclic=add_cyclic,
+        feature_cols=feature_cols,
+        include_target_pct=include_target_pct,
+        include_target_seed=include_target_seed,
+        save_series_path=save_series_path,
+        save_metrics_path=save_metrics_path,
+        parquet_compression=parquet_compression,
+    )
+
+
+def loso_predict_full_series_fast(
+    data: pd.DataFrame,
+    station_id: int,
+    *,
+    id_col: str = "station",
+    date_col: str = "date",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    alt_col: str = "altitude",
+    target_col: str = "prec",
+    start: str = "1961-01-01",
+    end: str = "2023-12-31",
+    rf_params: Dict = dict(
+        n_estimators=200,
+        max_depth=None,
+        random_state=42,
+        n_jobs=-1,
+    ),
+    add_cyclic: bool = False,
+    feature_cols: Optional[List[str]] = None,
+    k_neighbors: int = 50,
+    neighbor_map: Optional[Dict[int, List[int]]] = None,
+    include_target_pct: float = 0.0,
+    include_target_seed: int = 42,
+    save_series_path: Optional[str] = None,
+    save_metrics_path: Optional[str] = None,
+    parquet_compression: str = "snappy",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+    """
+    Backwards-compatible convenience wrapper for full-series LOSO with neighbors.
+
+    This function is intentionally thin: it simply delegates to
+    :func:`loso_predict_full_series_neighbors` with the same arguments,
+    so that older workflows that used a ``*_fast`` helper remain easy to
+    read and use.
+
+    Parameters
+    ----------
+    See :func:`loso_predict_full_series_neighbors`.
+
+    Returns
+    -------
+    See :func:`loso_predict_full_series_neighbors`.
+    """
+    return loso_predict_full_series_neighbors(
+        data,
+        station_id=station_id,
+        id_col=id_col,
+        date_col=date_col,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        alt_col=alt_col,
+        target_col=target_col,
+        start=start,
+        end=end,
+        k_neighbors=k_neighbors,
+        neighbor_map=neighbor_map,
+        rf_params=rf_params,
+        add_cyclic=add_cyclic,
+        feature_cols=feature_cols,
+        include_target_pct=include_target_pct,
+        include_target_seed=include_target_seed,
+        save_series_path=save_series_path,
+        save_metrics_path=save_metrics_path,
+        parquet_compression=parquet_compression,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1986,6 +2167,9 @@ def plot_compare_obs_rf_nasa(
     The function returns the matplotlib Figure/Axes objects plus a small
     metrics dictionary containing pairwise scores (obs vs RF, obs vs NASA).
 
+    Metrics shown in the legend labels are MAE, RMSE, R² and KGE. The full
+    metrics dictionary also includes NSE.
+
     Parameters
     ----------
     data:
@@ -2163,7 +2347,12 @@ def plot_compare_obs_rf_nasa(
         lbl = labels["nasa"]
         if "nasa" in metrics:
             m = metrics["nasa"]
-            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+            lbl = (
+                f"{lbl} — MAE={m['MAE']:.2f} "
+                f"RMSE={m['RMSE']:.2f} "
+                f"R²={m['R2']:.2f} "
+                f"KGE={m['KGE']:.2f}"
+            )
         ax.plot(
             series["nasa"].index,
             series["nasa"].values,
@@ -2174,7 +2363,12 @@ def plot_compare_obs_rf_nasa(
         lbl = labels["rf"]
         if "rf" in metrics:
             m = metrics["rf"]
-            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
+            lbl = (
+                f"{lbl} — MAE={m['MAE']:.2f} "
+                f"RMSE={m['RMSE']:.2f} "
+                f"R²={m['R2']:.2f} "
+                f"KGE={m['KGE']:.2f}"
+            )
         ax.plot(
             series["rf"].index,
             series["rf"].values,
@@ -2217,6 +2411,8 @@ __all__ = [
     # core & full series
     "loso_train_predict_station",
     "loso_predict_full_series",
+    "loso_predict_full_series_neighbors",
+    "loso_predict_full_series_fast",
     # evaluation
     "evaluate_all_stations",
     "evaluate_all_stations_fast",

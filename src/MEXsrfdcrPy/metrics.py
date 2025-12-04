@@ -17,6 +17,10 @@ Key design choices
 * Inputs are accepted as any iterable (lists, NumPy arrays, pandas Series).
 * Outputs are plain ``float`` or ``numpy.nan`` when the metric is undefined
   (for instance, zero variance in the observed series).
+* R² is **not** ``sklearn.metrics.r2_score``. Here it is defined as the
+  square of the Pearson correlation coefficient between observations and
+  predictions. This avoids redundancy with NSE, which already has the
+  “variance–explained” interpretation.
 * The code is intentionally self-contained and dependency-light, intended
   for reproducible climate-data workflows and suitable for a JOSS context.
 """
@@ -27,7 +31,7 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 # ---------------------------------------------------------------------
@@ -154,6 +158,12 @@ def nse(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
         Nash–Sutcliffe efficiency. ``np.nan`` is returned when:
         - the sample size is < 2, or
         - the variance of the observed series is zero.
+
+    Notes
+    -----
+    NSE is conceptually similar to the classical coefficient of
+    determination from linear regression, but it is not constrained
+    to the [0, 1] interval. Poor models can yield NSE < 0.
     """
     yt, yp = _as_arrays(y_true, y_pred)
 
@@ -179,10 +189,21 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float]) -> Dict
 
     - Mean Absolute Error (MAE)
     - Root Mean Squared Error (RMSE)
-    - Coefficient of determination (R²)
+    - Coefficient of determination (R², correlation-based)
     - Kling–Gupta Efficiency (KGE)
     - Nash–Sutcliffe Efficiency (NSE)
 
+    Definitions
+    -----------
+    * MAE and RMSE follow their usual definitions.
+    * R² is defined as the **square of the Pearson correlation
+      coefficient** between ``y_true`` and ``y_pred``. This differs from
+      ``sklearn.metrics.r2_score`` but avoids redundancy with NSE.
+    * NSE is the classical Nash–Sutcliffe efficiency.
+    * KGE follows Gupta et al. (2009).
+
+    Degenerate cases
+    ----------------
     For degenerate cases (very small sample size, zero variance in the
     observed series, etc.), the corresponding metric is set to ``np.nan``.
 
@@ -251,12 +272,16 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float]) -> Dict
     mse = float(mean_squared_error(yt, yp))
     rmse = float(np.sqrt(mse))
 
-    # R² only if variance exists
-    if float(np.var(yt)) > 0.0:
-        r2 = float(r2_score(yt, yp))
-    else:
+    # R² as squared Pearson correlation, not sklearn.r2_score
+    std_y = float(np.std(yt, ddof=1))
+    std_p = float(np.std(yp, ddof=1))
+    if std_y == 0.0 or std_p == 0.0:
         r2 = np.nan
+    else:
+        r = float(np.corrcoef(yt, yp)[0, 1])
+        r2 = float(r ** 2)
 
+    # Hydrological efficiencies
     kge_val = float(kge(yt, yp))
     nse_val = float(nse(yt, yp))
 
@@ -389,4 +414,3 @@ __all__ = [
     "regression_metrics",
     "aggregate_and_score",
 ]
-
