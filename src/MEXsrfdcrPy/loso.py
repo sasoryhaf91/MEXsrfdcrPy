@@ -3,22 +3,31 @@
 LOSO (Leave-One-Station-Out) Toolkit
 ====================================
 
-This module provides a compact, production-ready implementation of LOSO validation
-for daily climate records reconstruction with Random Forests. It supports:
+This module provides a compact, production-ready implementation of LOSO
+validation for daily climate records reconstruction with Random Forests. It
+supports:
 
-- Strict LOSO or partial inclusion of the target station in training via `include_target_pct`.
+- Strict LOSO or partial inclusion of the target station in training via
+  ``include_target_pct``.
 - Station-wise training/prediction on observed days and full-series prediction.
-- FAST evaluation across many stations with optional neighbor-based acceleration.
+- Fast evaluation across many stations with optional neighbor-based acceleration.
 - Flexible feature space: coordinates + calendar + optional covariates.
 - Robust metrics (MAE/RMSE/R²) with safe R² and resampling aliases.
-- Station filtering by minimum valid rows (`min_station_rows`).
+- Station filtering by minimum valid rows (``min_station_rows``).
 - Neighbor discovery (KDTree) and station–neighbor correlation tables.
-- Batch export of full daily series (per-station files + optional combined output).
+- Batch export of full daily series (per-station files + optional combined
+  output).
 - Comparison plots (Observed vs RF vs external/NASA) helper.
 
-Dependencies (runtime):
-- numpy, pandas, scikit-learn, matplotlib
-Optional:
+Runtime dependencies
+--------------------
+- numpy
+- pandas
+- scikit-learn
+- matplotlib
+
+Optional
+--------
 - geopandas, folium (only for maps in downstream modules)
 """
 
@@ -29,20 +38,22 @@ import os
 import re
 import time
 import warnings
-from dataclasses import dataclass  # kept for backward compatibility (not used directly)
+from dataclasses import dataclass  # currently unused, kept for backwards compat
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from pandas.api.types import DatetimeTZDtype
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neighbors import KDTree
 
-try:
-    from tqdm.auto import tqdm  # progress bar (optional)
+try:  # optional progress bar
+    from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
+
     def tqdm(x, **kwargs):
         return x
 
@@ -50,6 +61,8 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------
 # Warning policy (silence harmless warnings by default)
 # ---------------------------------------------------------------------
+
+
 def set_warning_policy(silence: bool = True) -> None:
     """
     Control warning levels for this module.
@@ -57,16 +70,32 @@ def set_warning_policy(silence: bool = True) -> None:
     Parameters
     ----------
     silence : bool
-        If True, silence FutureWarning and UndefinedMetricWarning.
+        If True, silence most Future/Deprecation warnings from pandas/sklearn
+        and UndefinedMetricWarning from sklearn (R² with zero variance, etc.).
     """
     warnings.resetwarnings()
     if silence:
+        # Future deprecations from pandas / sklearn
         warnings.filterwarnings("ignore", category=FutureWarning)
+
+        # DeprecationWarnings ruidosos de sklearn<->pandas (is_sparse, etc.)
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            module=r"sklearn\.utils\.validation",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            module=r"pandas\.core\.algorithms",
+        )
+
+        # Métricas indefinidas (R2 con varianza cero, etc.)
         try:
             from sklearn.exceptions import UndefinedMetricWarning
 
             warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
 
 
@@ -76,6 +105,8 @@ set_warning_policy(True)
 # ---------------------------------------------------------------------
 # Small I/O helpers
 # ---------------------------------------------------------------------
+
+
 def _ensure_parent_dir(path: Optional[str]) -> None:
     if not path:
         return
@@ -102,8 +133,10 @@ def _save_df(
     elif ext == ".xlsx":
         try:
             df.to_excel(path, index=False)
-        except Exception as e:  # pragma: no cover - requires extra deps
-            raise ValueError("Saving to .xlsx requires openpyxl or xlsxwriter.") from e
+        except Exception as e:  # pragma: no cover - optional dependency
+            raise ValueError(
+                "Saving to .xlsx requires 'openpyxl' or 'xlsxwriter'."
+            ) from e
     else:
         raise ValueError(f"Unsupported extension: {ext}")
     return path
@@ -119,14 +152,17 @@ def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------
-# Resolve extra covariate columns (case-insensitive + aliases)
+# Column resolution helpers
 # ---------------------------------------------------------------------
+
+
 def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     """
     Return the subset of column names that exist in df, resolving:
-      - a single string or an iterable of strings
-      - case-insensitive matching
-      - common aliases (e.g., PRETOTCORR -> PRECTOTCORR)
+
+    - a single string or an iterable of strings
+    - case-insensitive matching
+    - simple aliases (e.g., PRETOTCORR -> PRECTOTCORR)
 
     Ignores None and non-existing names.
     """
@@ -137,7 +173,6 @@ def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
 
     lower_map = {c.lower(): c for c in df.columns}
     aliases = {
-        # NASA GPM corrected precip (common typo)
         "pretotcorr": "prectotcorr",
     }
 
@@ -154,31 +189,50 @@ def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
 
 def resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     """
-    Public wrapper for `_resolve_columns` with a small diagnostic printout.
+    Public variant: resolve column names case-insensitively, accepting a string
+    or list of strings. Ignores missing names; prints a warning if none found.
+
+    Examples
+    --------
+    >>> resolve_columns(df, "PRECTOTCORR")
+    >>> resolve_columns(df, ["tmin", "tmax"])
     """
-    res = _resolve_columns(df, cols)
-    if not res and cols:
+    if cols is None:
+        return []
+    if isinstance(cols, str):
+        cols = [cols]
+
+    lower_map = {c.lower(): c for c in df.columns}
+    aliases = {"pretotcorr": "prectotcorr"}
+
+    resolved = []
+    for raw in cols:
+        if raw is None:
+            continue
+        key = aliases.get(str(raw).lower(), str(raw).lower())
+        if key in lower_map:
+            resolved.append(lower_map[key])
+
+    if len(resolved) == 0 and cols:
         print(
             f"[WARN] None of {cols} found in DataFrame. "
             f"Available (first 10): {list(df.columns)[:10]}"
         )
-    return res
+    return resolved
 
 
 # ---------------------------------------------------------------------
-# Generic utilities
+# Generic datetime / time-features utilities
 # ---------------------------------------------------------------------
+
+
 def ensure_datetime(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
     """
     Ensure `date_col` is timezone-naive datetime64 and drop invalid dates.
-
-    Uses the new pandas API (`isinstance(dtype, pd.DatetimeTZDtype)`) to
-    avoid deprecated helpers.
     """
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    dtype = out[date_col].dtype
-    if isinstance(dtype, pd.DatetimeTZDtype):
+    if isinstance(out[date_col].dtype, DatetimeTZDtype):
         out[date_col] = out[date_col].dt.tz_localize(None)
     return out.dropna(subset=[date_col])
 
@@ -204,6 +258,7 @@ def add_time_features(
 # ---------------------------------------------------------------------
 # Metrics and aggregation (safe R²; newer alias for resampling)
 # ---------------------------------------------------------------------
+
 _FREQ_ALIAS = {"M": "ME", "A": "YE", "Y": "YE", "Q": "QE"}
 
 
@@ -268,6 +323,8 @@ def aggregate_and_score(
 # ---------------------------------------------------------------------
 # Station selection and neighbors
 # ---------------------------------------------------------------------
+
+
 def select_stations(
     data: pd.DataFrame,
     *,
@@ -282,7 +339,7 @@ def select_stations(
     Returns a sorted list; if no filter given, returns all stations.
     """
     ids = data[id_col].dropna().astype(int).unique().tolist()
-    chosen = set()
+    chosen: set[int] = set()
 
     if prefix is not None:
         if isinstance(prefix, str):
@@ -325,7 +382,7 @@ def build_station_kneighbors(
     X = np.deg2rad(centroids[["lat", "lon"]].values)
     tree = KDTree(X, metric="euclidean")
     _, idx = tree.query(X, k=min(k + 1, len(centroids)))
-    neighbors = {}
+    neighbors: Dict[int, List[int]] = {}
     ids = centroids[id_col].tolist()
     for i, st in enumerate(ids):
         neigh_idx = idx[i][1:]  # exclude itself
@@ -358,6 +415,9 @@ def neighbor_correlation_table(
 
     df = data[[id_col, date_col, value_col]].copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if isinstance(df[date_col].dtype, DatetimeTZDtype):
+        df[date_col] = df[date_col].dt.tz_localize(None)
+
     if start or end:
         lo = pd.to_datetime(start) if start else df[date_col].min()
         hi = pd.to_datetime(end) if end else df[date_col].max()
@@ -374,7 +434,7 @@ def neighbor_correlation_table(
     )
     try:
         wide.columns = wide.columns.astype(int)
-    except Exception:  # pragma: no cover
+    except Exception:  # pragma: no cover - defensive
         pass
 
     if station_id not in wide.columns:
@@ -412,6 +472,8 @@ def neighbor_correlation_table(
 # ---------------------------------------------------------------------
 # Target sampling helper
 # ---------------------------------------------------------------------
+
+
 def sample_target_for_training(
     df: pd.DataFrame,
     *,
@@ -444,6 +506,8 @@ def sample_target_for_training(
 # ---------------------------------------------------------------------
 # Core LOSO (observed days)
 # ---------------------------------------------------------------------
+
+
 def loso_train_predict_station(
     data: pd.DataFrame,
     station_id: int,
@@ -476,7 +540,8 @@ def loso_train_predict_station(
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
     """
     Train on all stations except `station_id` (with optional target leakage),
-    predict on observed days of the target, and compute daily/monthly/annual metrics.
+    predict on observed days of the target, and compute daily/monthly/annual
+    metrics.
     """
     if model is None:
         rf_params = rf_params or dict(
@@ -563,6 +628,8 @@ def loso_train_predict_station(
 # ---------------------------------------------------------------------
 # Full series LOSO (y_pred_full + optional y_true)
 # ---------------------------------------------------------------------
+
+
 def loso_predict_full_series(
     data: pd.DataFrame,
     station_id: int,
@@ -628,9 +695,7 @@ def loso_predict_full_series(
         raise ValueError("Training set is empty after filtering.")
 
     model = RandomForestRegressor(**rf_params)
-    X_train = train_df[feature_cols].to_numpy(copy=False)
-    y_train = train_df[target_col].to_numpy(copy=False)
-    model.fit(X_train, y_train)
+    model.fit(train_df[feature_cols], train_df[target_col])
 
     dates = pd.date_range(
         start=pd.to_datetime(start),
@@ -648,8 +713,7 @@ def loso_predict_full_series(
     )
     synth = add_time_features(synth, date_col, add_cyclic=add_cyclic)
 
-    X_synth = synth[feature_cols].to_numpy(copy=False)
-    y_pred_full = model.predict(X_synth)
+    y_pred_full = model.predict(synth[feature_cols])
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -687,6 +751,8 @@ def loso_predict_full_series(
 # ---------------------------------------------------------------------
 # FAST EVALUATION
 # ---------------------------------------------------------------------
+
+
 def _append_rows_to_csv(
     rows: List[Dict],
     path: str,
@@ -717,13 +783,12 @@ def _preprocess_for_loso_fast(
     feature_cols: Optional[List[str]],
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    One-pass preprocessing for massive LOSO runs: datetime, clipping, time features,
-    covariates, and feature list assembly.
+    One-pass preprocessing for massive LOSO runs: datetime, clipping, time
+    features, covariates, and feature list assembly.
     """
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    dtype = df[date_col].dtype
-    if isinstance(dtype, pd.DatetimeTZDtype):
+    if isinstance(df[date_col].dtype, DatetimeTZDtype):
         df[date_col] = df[date_col].dt.tz_localize(None)
     df = df.dropna(subset=[date_col])
 
@@ -785,7 +850,7 @@ def evaluate_all_stations(
     """
     Classic LOSO: loop over stations without neighbor restriction.
     """
-    results = []
+    results: List[Dict] = []
     stations = data[id_col].dropna().unique()
 
     for st in stations:
@@ -897,8 +962,9 @@ def evaluate_all_stations_fast(
     parquet_compression: str = "snappy",
 ) -> pd.DataFrame:
     """
-    Fast LOSO evaluation with single-pass preprocessing, optional neighbor restriction,
-    controlled target leakage, and station filtering by minimum valid rows.
+    Fast LOSO evaluation with single-pass preprocessing, optional neighbor
+    restriction, controlled target leakage, and station filtering by minimum
+    valid rows.
     """
     # back-compat: var_col -> var_cols
     if var_cols is None and var_col is not None:
@@ -934,11 +1000,16 @@ def evaluate_all_stations_fast(
 
     if min_station_rows is not None:
         valid_counts = (
-            df.loc[valid_mask_global, [id_col]].groupby(id_col).size().astype(int)
+            df.loc[valid_mask_global, [id_col]]
+            .groupby(id_col)
+            .size()
+            .astype(int)
         )
         before_n = len(stations)
         stations = [
-            s for s in stations if int(valid_counts.get(s, 0)) >= int(min_station_rows)
+            s
+            for s in stations
+            if int(valid_counts.get(s, 0)) >= int(min_station_rows)
         ]
         if show_progress:
             tqdm.write(
@@ -1019,11 +1090,7 @@ def evaluate_all_stations_fast(
                 n=n_take,
                 random_state=include_target_seed,
             ).index
-            train_df = pd.concat(
-                [train_pool, df.loc[idx_sample]],
-                axis=0,
-                copy=False,
-            )
+            train_df = pd.concat([train_pool, df.loc[idx_sample]], axis=0, copy=False)
         else:
             train_df = train_pool
 
@@ -1119,7 +1186,8 @@ def evaluate_all_stations_fast(
         if show_progress:
             tqdm.write(
                 f"Station {sid}: {sec:.2f}s  "
-                f"(train={len(train_df):,}  test={len(test_df):,}  incl={pct:.1f}%)"
+                f"(train={len(train_df):,}  test={len(test_df):,} "
+                f"incl={pct:.1f}%)"
             )
 
     if log_csv and pending:
@@ -1140,6 +1208,8 @@ def evaluate_all_stations_fast(
 # ---------------------------------------------------------------------
 # Export of full-series (per station and batch)
 # ---------------------------------------------------------------------
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -1182,6 +1252,8 @@ def export_full_series_station(
     """
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if isinstance(df[date_col].dtype, DatetimeTZDtype):
+        df[date_col] = df[date_col].dt.tz_localize(None)
 
     if k_neighbors is not None:
         if neighbor_map is None:
@@ -1223,7 +1295,7 @@ def export_full_series_station(
     )
 
     _ensure_dir(out_dir)
-    base = f"loso_fullseries_{station_id}_{start.replace('-','')}_{end.replace('-','')}"
+    base = f"loso_fullseries_{station_id}_{start.replace('-', '')}_{end.replace('-', '')}"
     if file_format.lower() == "parquet":
         out_path = os.path.join(out_dir, base + ".parquet")
         full_df.to_parquet(out_path, index=False, compression=parquet_compression)
@@ -1279,7 +1351,8 @@ def export_full_series_batch(
 ) -> pd.DataFrame:
     """
     Export full daily series for many stations (per-station files + manifest),
-    and optionally create a combined file in either "input_like" or "compact" schema.
+    and optionally create a combined file in either "input_like" or "compact"
+    schema.
     """
     stations = select_stations(
         data,
@@ -1306,7 +1379,7 @@ def export_full_series_batch(
         if combine_format.lower() == "csv" and os.path.exists(combine_output_path):
             os.remove(combine_output_path)
 
-    rows = []
+    rows: List[Dict] = []
     it = (
         tqdm(stations, desc="Exporting full series", unit="st")
         if show_progress
@@ -1320,11 +1393,7 @@ def export_full_series_batch(
                 neigh_ids = neighbor_map.get(sid, [])
                 df_train = data[data[id_col].isin(neigh_ids)]
                 df_test = data[data[id_col] == sid]
-                df_local = pd.concat(
-                    [df_train, df_test],
-                    axis=0,
-                    copy=False,
-                )
+                df_local = pd.concat([df_train, df_test], axis=0, copy=False)
             else:
                 df_local = data
 
@@ -1347,14 +1416,10 @@ def export_full_series_batch(
             )
 
             _ensure_dir(out_dir)
-            base = f"loso_fullseries_{sid}_{start.replace('-','')}_{end.replace('-','')}"
+            base = f"loso_fullseries_{sid}_{start.replace('-', '')}_{end.replace('-', '')}"
             if file_format.lower() == "parquet":
                 path = os.path.join(out_dir, base + ".parquet")
-                full_df.to_parquet(
-                    path,
-                    index=False,
-                    compression=parquet_compression,
-                )
+                full_df.to_parquet(path, index=False, compression=parquet_compression)
             elif file_format.lower() == "csv":
                 path = os.path.join(out_dir, base + ".csv")
                 full_df.to_csv(path, index=csv_index)
@@ -1395,7 +1460,7 @@ def export_full_series_batch(
                         part["y_pred_full"],
                     )
                     part = part[["station", "y_pred_full", "y_true", date_col, target_col]]
-                else:
+                else:  # pragma: no cover
                     raise ValueError(
                         "combine_schema must be 'input_like' or 'compact'."
                     )
@@ -1410,7 +1475,7 @@ def export_full_series_batch(
                     header_written = True
                 elif combine_format.lower() == "parquet":
                     combine_parts.append(part)
-                else:
+                else:  # pragma: no cover
                     raise ValueError("combine_format must be 'csv' or 'parquet'.")
 
             sec = time.time() - t0
@@ -1453,14 +1518,17 @@ def export_full_series_batch(
                 }
             )
 
-    if combine_output_path is not None and combine_format.lower() == "parquet":
-        if len(combine_parts) > 0:
-            big = pd.concat(combine_parts, axis=0, ignore_index=True)
-            big.to_parquet(
-                combine_output_path,
-                index=False,
-                compression=combine_parquet_compression,
-            )
+    if (
+        combine_output_path is not None
+        and combine_format.lower() == "parquet"
+        and len(combine_parts) > 0
+    ):
+        big = pd.concat(combine_parts, axis=0, ignore_index=True)
+        big.to_parquet(
+            combine_output_path,
+            index=False,
+            compression=combine_parquet_compression,
+        )
 
     manifest = pd.DataFrame(rows)
     if manifest_path:
@@ -1469,7 +1537,11 @@ def export_full_series_batch(
     return manifest
 
 
-# --- FAST full-series LOSO (neighbors + single-pass prep) --------------------
+# ---------------------------------------------------------------------
+# Fast full-series LOSO (neighbors + single-pass prep)
+# ---------------------------------------------------------------------
+
+
 def loso_predict_full_series_fast(
     data: pd.DataFrame,
     station_id: int,
@@ -1495,7 +1567,7 @@ def loso_predict_full_series_fast(
     ),
     add_cyclic: bool = False,
     feature_cols: Optional[List[str]] = None,
-    var_cols: Optional[Iterable[str]] = None,  # extra covariates (resolved if present)
+    var_cols: Optional[Iterable[str]] = None,  # extra covariates
     # neighbors
     k_neighbors: Optional[int] = None,
     neighbor_map: Optional[Dict[int, List[int]]] = None,
@@ -1510,9 +1582,12 @@ def loso_predict_full_series_fast(
     """
     Fast LOSO full-series prediction for one station.
 
-    - Trains on all stations except the target (optionally only its k nearest neighbors).
-    - Optionally includes a percentage of target rows in training (include_target_pct).
-    - Predicts a continuous daily series [start, end] at the station's median coordinates.
+    - Trains on all stations except the target (optionally only its k nearest
+      neighbors).
+    - Optionally includes a percentage of target rows in training
+      (include_target_pct).
+    - Predicts a continuous daily series [start, end] at the station's median
+      coordinates.
     - Returns (full_df, metrics, fitted_model, feature_cols).
 
     full_df columns:
@@ -1522,8 +1597,7 @@ def loso_predict_full_series_fast(
     # 1) Ensure datetime, and optionally clip a training window
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    dtype = df[date_col].dtype
-    if isinstance(dtype, pd.DatetimeTZDtype):
+    if isinstance(df[date_col].dtype, DatetimeTZDtype):
         df[date_col] = df[date_col].dt.tz_localize(None)
     df = df.dropna(subset=[date_col])
 
@@ -1631,8 +1705,7 @@ def loso_predict_full_series_fast(
         synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
         synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
 
-    X_synth = synth[feats].to_numpy(copy=False)
-    y_pred_full = model.predict(X_synth)
+    y_pred_full = model.predict(synth[feats])
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -1670,13 +1743,18 @@ def loso_predict_full_series_fast(
 
     metrics = {"daily": daily, "monthly": monthly, "annual": annual}
 
+    # 11) Optional saves
     _save_df(full_df, save_series_path, parquet_compression=parquet_compression)
     _save_json(metrics, save_metrics_path)
 
     return full_df, metrics, model, feats
 
 
-# ________________________PLOT NEW_____________________--
+# ---------------------------------------------------------------------
+# Plot helper
+# ---------------------------------------------------------------------
+
+
 def plot_compare_obs_rf_nasa(
     data: pd.DataFrame,
     *,
@@ -1691,7 +1769,7 @@ def plot_compare_obs_rf_nasa(
     rf_date_col: str = "date",
     rf_value_col: Optional[str] = "y_pred_full",
     rf_label: Optional[str] = "RF",
-    # NEW: arbitrary external source (grid, reanalysis, another model, etc.)
+    # extra external source
     extra: Optional[Union[pd.DataFrame, pd.Series, np.ndarray, list]] = None,
     extra_date_col: str = "date",
     extra_value_col: Optional[str] = None,
@@ -1700,8 +1778,8 @@ def plot_compare_obs_rf_nasa(
     start: Optional[str] = None,
     end: Optional[str] = None,
     resample: Optional[str] = "D",  # "D", "M", "YE", or None
-    agg: Optional[str] = "mean",  # "mean" | "sum" | "median"; used if resample is not None
-    smooth: Optional[int] = None,  # rolling window (centered)
+    agg: Optional[str] = "mean",
+    smooth: Optional[int] = None,
     # plot aesthetics / IO
     figsize: Optional[Tuple[int, int]] = (12, 5),
     title: Optional[str] = None,
@@ -1712,24 +1790,24 @@ def plot_compare_obs_rf_nasa(
     ylim: Optional[Tuple[float, float]] = None,
     date_fmt: Optional[str] = None,
     save_to: Optional[str] = None,
-    # style dictionaries (optional overrides)
-    obs_style: Optional[Dict] = None,  # points by default
-    nasa_style: Optional[Dict] = None,  # line by default
-    rf_style: Optional[Dict] = None,  # line by default
-    extra_style: Optional[Dict] = None,  # line by default
+    # style dictionaries
+    obs_style: Optional[Dict] = None,
+    nasa_style: Optional[Dict] = None,
+    rf_style: Optional[Dict] = None,
+    extra_style: Optional[Dict] = None,
 ) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
     """
     Plot Observed vs. RF vs. NASA with an optional fourth external series, and
     report MAE/RMSE/R² (computed against Observed where available).
 
-    This function is resilient to missing series: it plots what is available.
+    All series are aligned in time; metrics are computed via inner-join on the
+    datetime index wherever observations exist.
     """
 
     # ------------------------ helpers ------------------------
     def _ensure_dt(s: pd.Series) -> pd.Series:
         s = pd.to_datetime(s, errors="coerce")
-        dtype = s.dtype
-        if isinstance(dtype, pd.DatetimeTZDtype):
+        if isinstance(s.dtype, DatetimeTZDtype):
             s = s.dt.tz_localize(None)
         return s
 
@@ -1766,11 +1844,12 @@ def plot_compare_obs_rf_nasa(
                 raise ValueError("A plain Series must be datetime-indexed.")
             return s.sort_index()
         if isinstance(obj, (list, np.ndarray)):
-            return pd.Series(obj)  # length alignment handled later
+            return pd.Series(obj)
         if isinstance(obj, pd.DataFrame):
             if vcol is None or dcol not in obj.columns or vcol not in obj.columns:
                 raise ValueError(
-                    "For a DataFrame `extra`, provide valid extra_date_col and extra_value_col."
+                    "For a DataFrame `extra`, provide valid extra_date_col and "
+                    "extra_value_col."
                 )
             tmp = obj[[dcol, vcol]].dropna().copy()
             tmp[dcol] = _ensure_dt(tmp[dcol])
@@ -1792,7 +1871,7 @@ def plot_compare_obs_rf_nasa(
     labels: Dict[str, str] = {}
     metrics: Dict[str, Dict[str, float]] = {}
 
-    # OBS
+    # Observed
     if obs_col is not None and obs_col in base.columns:
         obs = base[[date_col, obs_col]].dropna().rename(columns={obs_col: "obs"})
         obs[date_col] = _ensure_dt(obs[date_col])
@@ -1825,18 +1904,13 @@ def plot_compare_obs_rf_nasa(
             series["rf"] = rf
             labels["rf"] = rf_label or "RF"
 
-    # EXTRA (NEW)
+    # EXTRA
     extra_series = None
     if extra is not None:
-        try:
-            extra_series = _to_series(extra, extra_date_col, extra_value_col)
-        except Exception as e:
-            raise ValueError(f"Could not resolve `extra` into a time series: {e}")
-
+        extra_series = _to_series(extra, extra_date_col, extra_value_col)
         if isinstance(extra_series.index, pd.DatetimeIndex):
             series["extra"] = extra_series.sort_index()
             labels["extra"] = extra_label
-        # else: deferred alignment below
 
     def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
         pair = pd.concat([a, b], axis=1, join="inner").dropna()
@@ -1856,11 +1930,11 @@ def plot_compare_obs_rf_nasa(
     for k in list(series.keys()):
         series[k] = _prep(series[k])
 
-    # If extra is a vector (no datetime index), align length with observed
+    # If extra was a plain vector, align with observed after resampling
     if extra is not None and not isinstance(extra_series.index, pd.DatetimeIndex):
         if "obs" not in series:
             raise ValueError(
-                "Non-indexed `extra` requires an observed series to align lengths."
+                "Cannot align vector `extra` without an observed series."
             )
         obs_idx = series["obs"].index
         vec = pd.Series(extra_series, index=pd.RangeIndex(len(extra_series)))
@@ -1884,22 +1958,32 @@ def plot_compare_obs_rf_nasa(
             metrics["extra"] = _pair_metrics(series["obs"], series["extra"])
 
     # ------------------------ plot ------------------------
-    obs_style = dict(
-        {"marker": "o", "ms": 3, "alpha": 0.7, "color": "#37474F", "ls": ""},
+    obs_style = {
+        "marker": "o",
+        "ms": 3,
+        "alpha": 0.7,
+        "color": "#37474F",
+        "ls": "",
         **(obs_style or {}),
-    )
-    nasa_style = dict(
-        {"lw": 2.0, "alpha": 0.9, "color": "#B71C1C"},
+    }
+    nasa_style = {
+        "lw": 2.0,
+        "alpha": 0.9,
+        "color": "#B71C1C",
         **(nasa_style or {}),
-    )
-    rf_style = dict(
-        {"lw": 2.0, "alpha": 0.9, "color": "#1E88E5"},
+    }
+    rf_style = {
+        "lw": 2.0,
+        "alpha": 0.9,
+        "color": "#1E88E5",
         **(rf_style or {}),
-    )
-    extra_style = dict(
-        {"lw": 2.0, "alpha": 0.9, "color": "#43A047"},
+    }
+    extra_style = {
+        "lw": 2.0,
+        "alpha": 0.9,
+        "color": "#43A047",
         **(extra_style or {}),
-    )
+    }
 
     fig, ax = plt.subplots(figsize=figsize or (12, 5))
 
@@ -1936,10 +2020,7 @@ def plot_compare_obs_rf_nasa(
         lbl = labels["extra"]
         if "extra" in metrics:
             m = metrics["extra"]
-            lbl = (
-                f"{lbl} — MAE={m['MAE']:.2f} "
-                f"RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
-            )
+            lbl = f"{lbl} — MAE={m['MAE']:.2f} RMSE={m['RMSE']:.2f} R²={m['R2']:.2f}"
         ax.plot(
             series["extra"].index,
             series["extra"].values,
@@ -1993,5 +2074,4 @@ __all__ = [
     "add_time_features",
     "aggregate_and_score",
     "set_warning_policy",
-    "resolve_columns",
 ]
