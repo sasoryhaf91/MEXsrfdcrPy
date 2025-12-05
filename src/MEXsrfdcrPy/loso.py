@@ -38,7 +38,6 @@ import os
 import re
 import time
 import warnings
-from dataclasses import dataclass  # currently unused, kept for backwards compat
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import matplotlib
@@ -50,7 +49,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neighbors import KDTree
 
-try:  # optional progress bar
+try:
+    # Optional progress bar
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
 
@@ -65,45 +65,67 @@ except Exception:  # pragma: no cover
 
 def set_warning_policy(silence: bool = True) -> None:
     """
-    Control warning levels for this module.
+    Configure warning filters for this module.
 
     Parameters
     ----------
-    silence : bool
-        If True, silence most Future/Deprecation warnings from pandas/sklearn
-        and UndefinedMetricWarning from sklearn (R² with zero variance, etc.).
+    silence : bool, default True
+        If True, silences:
+        - Most Future/Deprecation warnings from pandas/scikit-learn.
+        - The noisy ``is_sparse is deprecated`` DeprecationWarning emitted
+          by ``sklearn.utils.validation``.
+        - ``UndefinedMetricWarning`` (e.g., R² with zero variance).
+
+    Notes
+    -----
+    The filters are intentionally narrow for the sklearn deprecation:
+    they match by message content rather than module only, to survive
+    changes in the internal module path, while avoiding silencing
+    unrelated deprecations.
     """
+    # Reset then re-apply filters so that notebook/global config does not
+    # override our intent.
     warnings.resetwarnings()
-    if silence:
-        # Future deprecations from pandas / sklearn
-        warnings.filterwarnings("ignore", category=FutureWarning)
 
-        # DeprecationWarnings ruidosos de sklearn<->pandas (is_sparse, etc.)
-        warnings.filterwarnings(
-            "ignore",
-            category=DeprecationWarning,
-            module=r"sklearn\.utils\.validation",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            category=DeprecationWarning,
-            module=r"pandas\.core\.algorithms",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            category=DeprecationWarning,
-            message=".*is_sparse is deprecated.*",
-        )
+    if not silence:
+        return
 
-        # Métricas indefinidas (R2 con varianza cero, etc.)
-        try:
-            from sklearn.exceptions import UndefinedMetricWarning
+    # Generic future deprecations from pandas / sklearn interplay.
+    warnings.filterwarnings("ignore", category=FutureWarning)
 
-            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-        except Exception:
-            pass
+    # Specific sklearn / pandas bridge deprecation about is_sparse.
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r".*is_sparse is deprecated and will be removed in a future version.*",
+    )
+
+    # Some environments phrase the message slightly differently; keep a
+    # second, more generic pattern.
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r".*pd\.SparseDtype.*",
+    )
+
+    # Optionally, silence deprecations coming from pandas algorithms
+    # (this covers dtype-related warnings that are not actionable here).
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        module=r"pandas\.core\.algorithms",
+    )
+
+    # Metrics warnings (e.g. R² undefined when y_true has zero variance).
+    try:
+        from sklearn.exceptions import UndefinedMetricWarning
+
+        warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+    except Exception:  # pragma: no cover
+        pass
 
 
+# Apply default warning policy on import.
 set_warning_policy(True)
 
 
@@ -125,6 +147,23 @@ def _save_df(
     *,
     parquet_compression: str = "snappy",
 ) -> Optional[str]:
+    """
+    Save a DataFrame to CSV/Parquet/Feather/Excel depending on the extension.
+
+    Parameters
+    ----------
+    df : DataFrame
+        DataFrame to save.
+    path : str or None
+        Output path. If None, nothing is saved and None is returned.
+    parquet_compression : {"snappy", "gzip", ...}, default "snappy"
+        Compression for Parquet output.
+
+    Returns
+    -------
+    str or None
+        The path used, or None if ``path`` is None.
+    """
     if path is None:
         return None
     _ensure_parent_dir(path)
@@ -148,6 +187,21 @@ def _save_df(
 
 
 def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
+    """
+    Save a JSON-serializable object to disk.
+
+    Parameters
+    ----------
+    obj : dict
+        JSON-serializable object.
+    path : str or None
+        Output path. If None, nothing is saved and None is returned.
+
+    Returns
+    -------
+    str or None
+        The path used, or None if ``path`` is None.
+    """
     if path is None:
         return None
     _ensure_parent_dir(path)
@@ -163,13 +217,17 @@ def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
 
 def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     """
-    Return the subset of column names that exist in df, resolving:
+    Internal helper: resolve column names case-insensitively, with aliases.
 
-    - a single string or an iterable of strings
-    - case-insensitive matching
-    - simple aliases (e.g., PRETOTCORR -> PRECTOTCORR)
+    Parameters
+    ----------
+    df : DataFrame
+    cols : str or iterable of str
 
-    Ignores None and non-existing names.
+    Returns
+    -------
+    list of str
+        Only the column names that actually exist in ``df``.
     """
     if cols is None:
         return []
@@ -194,36 +252,26 @@ def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
 
 def resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     """
-    Public variant: resolve column names case-insensitively, accepting a string
-    or list of strings. Ignores missing names; prints a warning if none found.
+    Public variant of ``_resolve_columns``.
+
+    Resolve column names case-insensitively and ignore missing names.
+
+    Parameters
+    ----------
+    df : DataFrame
+    cols : str or iterable of str
+
+    Returns
+    -------
+    list of str
+        The subset of names that exist in the DataFrame.
 
     Examples
     --------
     >>> resolve_columns(df, "PRECTOTCORR")
     >>> resolve_columns(df, ["tmin", "tmax"])
     """
-    if cols is None:
-        return []
-    if isinstance(cols, str):
-        cols = [cols]
-
-    lower_map = {c.lower(): c for c in df.columns}
-    aliases = {"pretotcorr": "prectotcorr"}
-
-    resolved = []
-    for raw in cols:
-        if raw is None:
-            continue
-        key = aliases.get(str(raw).lower(), str(raw).lower())
-        if key in lower_map:
-            resolved.append(lower_map[key])
-
-    if len(resolved) == 0 and cols:
-        print(
-            f"[WARN] None of {cols} found in DataFrame. "
-            f"Available (first 10): {list(df.columns)[:10]}"
-        )
-    return resolved
+    return _resolve_columns(df, cols)
 
 
 # ---------------------------------------------------------------------
@@ -233,7 +281,18 @@ def resolve_columns(df: pd.DataFrame, cols) -> List[str]:
 
 def ensure_datetime(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
     """
-    Ensure `date_col` is timezone-naive datetime64 and drop invalid dates.
+    Ensure ``date_col`` is timezone-naive ``datetime64[ns]`` and drop invalid
+    dates.
+
+    Parameters
+    ----------
+    df : DataFrame
+    date_col : str, default "date"
+
+    Returns
+    -------
+    DataFrame
+        Copy of ``df`` with a cleaned datetime column and invalid rows removed.
     """
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
@@ -248,7 +307,20 @@ def add_time_features(
     add_cyclic: bool = False,
 ) -> pd.DataFrame:
     """
-    Add calendar features: year, month, day-of-year; optional cyclic sines/cosines.
+    Add calendar features (year, month, day-of-year) and optionally cyclic
+    sines/cosines for day-of-year.
+
+    Parameters
+    ----------
+    df : DataFrame
+    date_col : str, default "date"
+    add_cyclic : bool, default False
+        If True, adds ``doy_sin`` and ``doy_cos`` columns.
+
+    Returns
+    -------
+    DataFrame
+        Copy of the input with added time features.
     """
     out = df.copy()
     out["year"] = out[date_col].dt.year
@@ -261,7 +333,7 @@ def add_time_features(
 
 
 # ---------------------------------------------------------------------
-# Metrics and aggregation (safe R²; newer alias for resampling)
+# Metrics and aggregation (safe R²; resampling aliases)
 # ---------------------------------------------------------------------
 
 _FREQ_ALIAS = {"M": "ME", "A": "YE", "Y": "YE", "Q": "QE"}
@@ -272,25 +344,28 @@ def _safe_metrics(
     y_pred: Iterable[float],
 ) -> Dict[str, float]:
     """
-    Compute MAE, RMSE, and R² safely: R² is NaN when n<2 or zero variance.
-    Inputs are converted to numpy.float64 and we locally silence the
-    'is_sparse is deprecated' warning in case sklearn inspects dtypes.
-    """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
+    Compute MAE, RMSE and R² in a robust way.
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            category=DeprecationWarning,
-            message=".*is_sparse is deprecated.*",
-        )
-        mae = mean_absolute_error(y_true, y_pred)
-        rmse = mean_squared_error(y_true, y_pred, squared=False)
-        if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
-            r2 = r2_score(y_true, y_pred)
-        else:
-            r2 = np.nan
+    - R² is set to NaN when the variance of ``y_true`` is zero or when
+      there are fewer than 2 observations.
+
+    Parameters
+    ----------
+    y_true, y_pred : array-like
+
+    Returns
+    -------
+    dict
+        Keys: ``{"MAE", "RMSE", "R2"}``.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
+        r2 = r2_score(y_true, y_pred)
+    else:
+        r2 = np.nan
     return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
 
@@ -304,19 +379,27 @@ def aggregate_and_score(
     agg: str = "sum",
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     """
-    Aggregate daily predictions to `freq` and compute metrics on the overlap.
+    Aggregate daily predictions to a lower frequency and compute metrics.
 
     Parameters
     ----------
     df_pred : DataFrame
-        Table with [date_col, y_col, yhat_col].
-    freq : str
-        Resampling code. Aliases M->ME, A/Y->YE, Q->QE to avoid pandas warnings.
-    agg : {"sum", "mean", "median"}
+        Must contain ``[date_col, y_col, yhat_col]``.
+    date_col : str, default "date"
+    y_col : str, default "y_true"
+    yhat_col : str, default "y_pred"
+    freq : str, default "M"
+        Resampling code. Aliases are applied to avoid pandas deprecation
+        warnings, e.g. "M" -> "ME", "A"/"Y" -> "YE", "Q" -> "QE".
+    agg : {"sum", "mean", "median"}, default "sum"
+        Aggregation function.
 
     Returns
     -------
-    (metrics_dict, aggregated_dataframe)
+    metrics : dict
+        MAE, RMSE, R² at the aggregated frequency.
+    agg_df : DataFrame
+        Aggregated series with the same columns.
     """
     freq = _FREQ_ALIAS.get(freq, freq)
     aggfunc = {"sum": "sum", "mean": "mean", "median": "median"}[agg]
@@ -349,8 +432,27 @@ def select_stations(
     custom_filter: Optional[Callable[[int], bool]] = None,
 ) -> List[int]:
     """
-    Select station ids using OR semantics across filters.
-    Returns a sorted list; if no filter given, returns all stations.
+    Select station ids using OR semantics across several filters.
+
+    Parameters
+    ----------
+    data : DataFrame
+    id_col : str, default "station"
+    prefix : str or iterable of str, optional
+        Match stations whose string representation starts with any of these
+        prefixes.
+    station_ids : iterable of int, optional
+        Explicit station ids to include.
+    regex : str, optional
+        Regular expression applied to the string representation of station ids.
+    custom_filter : callable, optional
+        Function receiving an integer station id and returning True/False.
+
+    Returns
+    -------
+    list of int
+        Sorted list of selected station ids. If no filter is provided,
+        all stations are returned.
     """
     ids = data[id_col].dropna().astype(int).unique().tolist()
     chosen: set[int] = set()
@@ -385,7 +487,20 @@ def build_station_kneighbors(
     k: int = 100,
 ) -> Dict[int, List[int]]:
     """
-    For each station, return its k nearest neighbors using median lat/lon.
+    Return k nearest neighbors for each station using median lat/lon.
+
+    Parameters
+    ----------
+    data : DataFrame
+    id_col, lat_col, lon_col : str
+        Column names for station id and coordinates.
+    k : int, default 100
+        Number of neighbors (excluding the station itself).
+
+    Returns
+    -------
+    dict
+        Mapping ``station_id -> list of neighbor station_ids``.
     """
     centroids = (
         data.groupby(id_col)[[lat_col, lon_col]]
@@ -419,8 +534,27 @@ def neighbor_correlation_table(
     parquet_compression: str = "snappy",
 ) -> pd.DataFrame:
     """
-    Daily Pearson correlations between a target station and its neighbors
-    over the overlapping days (NaN if < min_overlap or zero variance).
+    Compute daily Pearson correlations between a target station and its
+    neighbors over overlapping days.
+
+    Parameters
+    ----------
+    data : DataFrame
+    station_id : int
+    neighbor_ids : iterable of int
+    id_col, date_col, value_col : str
+    start, end : str or None
+        Optional date limits for the analysis window.
+    min_overlap : int, default 60
+        Minimum number of daily overlaps required to report a correlation.
+    save_table_path : str or None
+        Optional path to save the resulting table.
+    parquet_compression : str, default "snappy"
+
+    Returns
+    -------
+    DataFrame
+        Columns: ``["neighbor", "corr", "n_overlap"]``.
     """
     if not neighbor_ids:
         res = pd.DataFrame(columns=["neighbor", "corr", "n_overlap"])
@@ -448,7 +582,7 @@ def neighbor_correlation_table(
     )
     try:
         wide.columns = wide.columns.astype(int)
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover
         pass
 
     if station_id not in wide.columns:
@@ -492,7 +626,7 @@ def sample_target_for_training(
     df: pd.DataFrame,
     *,
     id_col: str,
-    date_col: str,
+    date_col: str,  # kept for API symmetry (not used here but may be useful)
     target_col: str,
     feature_cols: List[str],
     station_id: int,
@@ -500,8 +634,29 @@ def sample_target_for_training(
     random_state: int = 42,
 ) -> pd.DataFrame:
     """
-    Return a subset of the target station rows to be *leaked* into training,
-    sized by `include_target_pct` (%), only using fully valid rows.
+    Sample a percentage of the target-station rows to be *leaked* into the
+    training set.
+
+    Only rows where all features and the target are valid (non-missing) are
+    eligible for sampling.
+
+    Parameters
+    ----------
+    df : DataFrame
+    id_col : str
+    date_col : str
+    target_col : str
+    feature_cols : list of str
+    station_id : int
+    include_target_pct : float
+        Percentage of eligible rows to include (0–100).
+    random_state : int, default 42
+
+    Returns
+    -------
+    DataFrame
+        Sampled rows. If ``include_target_pct <= 0`` or there are no valid
+        rows, an empty DataFrame is returned.
     """
     pct = max(0.0, min(float(include_target_pct), 100.0))
     if pct <= 0.0:
@@ -518,7 +673,7 @@ def sample_target_for_training(
 
 
 # ---------------------------------------------------------------------
-# Core LOSO (observed days)
+# Core LOSO (observed days only)
 # ---------------------------------------------------------------------
 
 
@@ -553,9 +708,47 @@ def loso_train_predict_station(
     parquet_compression: str = "snappy",
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
     """
-    Train on all stations except `station_id` (with optional target leakage),
-    predict on observed days of the target, and compute daily/monthly/annual
-    metrics.
+    Classic LOSO for a single station on observed days only.
+
+    Training data:
+        All stations except ``station_id`` plus, optionally, a percentage of
+        target-station rows (``include_target_pct``).
+
+    Test data:
+        Observed days of the target station within the requested period.
+
+    Parameters
+    ----------
+    data : DataFrame
+    station_id : int
+    id_col, date_col, lat_col, lon_col, alt_col, target_col : str
+    feature_cols : list of str or None
+        If None, defaults to::
+            [lat_col, lon_col, alt_col, "year", "month", "doy"] (+ cyclic terms).
+    add_cyclic : bool, default False
+    model : scikit-learn regressor or None, default None
+        If None, a new RandomForestRegressor is created from ``rf_params``.
+    rf_params : dict or None
+    agg_for_metrics : {"sum", "mean", "median"}
+        Aggregation for monthly and annual metrics.
+    start, end : str or None
+        Optional test window.
+    include_target_pct : float, default 0.0
+        Percentage (0–100) of target-station rows to inject into training.
+    include_target_seed : int, default 42
+    save_predictions_path, save_metrics_path : str or None
+        Optional paths where predictions/metrics are saved.
+
+    Returns
+    -------
+    out : DataFrame
+        Columns: [date_col, "station", "y_true", "y_pred"].
+    metrics : dict
+        ``{"daily": {...}, "monthly": {...}, "annual": {...}}``.
+    model : object
+        Fitted model.
+    feature_cols : list of str
+        The feature columns actually used.
     """
     if model is None:
         rf_params = rf_params or dict(
@@ -606,8 +799,16 @@ def loso_train_predict_station(
     X_test = test_df[feature_cols].to_numpy(copy=False)
     y_test = test_df[target_col].to_numpy(copy=False)
 
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+    with warnings.catch_warnings():
+        # Extra safety: silence is_sparse warnings inside fit/predict even if
+        # global filters were changed externally.
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*is_sparse is deprecated and will be removed in a future version.*",
+        )
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
 
     out = test_df[[date_col, id_col]].copy()
     out.rename(columns={id_col: "station"}, inplace=True)
@@ -672,8 +873,32 @@ def loso_predict_full_series(
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
     """
     Train (LOSO or partial leakage) and predict a full daily series [start, end]
-    for `station_id`. Returns full dataframe and metrics computed only over
-    the overlap with observed data.
+    for a single station.
+
+    Metrics are computed only over the overlap with observed data.
+
+    Parameters
+    ----------
+    data : DataFrame
+    station_id : int
+    id_col, date_col, lat_col, lon_col, alt_col, target_col : str
+    start, end : str
+        Full prediction horizon.
+    rf_params : dict
+        Parameters for RandomForestRegressor.
+    add_cyclic : bool, default False
+    feature_cols : list of str or None
+    include_target_pct : float, default 0.0
+    include_target_seed : int, default 42
+    save_series_path, save_metrics_path : str or None
+
+    Returns
+    -------
+    full_df : DataFrame
+        Columns: [date, "station", "y_pred_full", "y_true?"].
+    metrics : dict
+    model : object
+    feature_cols : list of str
     """
     df = ensure_datetime(data, date_col)
 
@@ -709,7 +934,13 @@ def loso_predict_full_series(
         raise ValueError("Training set is empty after filtering.")
 
     model = RandomForestRegressor(**rf_params)
-    model.fit(train_df[feature_cols], train_df[target_col])
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*is_sparse is deprecated and will be removed in a future version.*",
+        )
+        model.fit(train_df[feature_cols], train_df[target_col])
 
     dates = pd.date_range(
         start=pd.to_datetime(start),
@@ -763,7 +994,7 @@ def loso_predict_full_series(
 
 
 # ---------------------------------------------------------------------
-# FAST EVALUATION
+# FAST EVALUATION (many stations)
 # ---------------------------------------------------------------------
 
 
@@ -773,6 +1004,16 @@ def _append_rows_to_csv(
     *,
     header_written_flag: Dict[str, bool],
 ) -> None:
+    """
+    Append rows to a CSV file, writing the header only once.
+
+    Parameters
+    ----------
+    rows : list of dict
+    path : str
+    header_written_flag : dict
+        Mutable state tracking whether the header has been written.
+    """
     if not rows or path is None:
         return
     df_tmp = pd.DataFrame(rows)
@@ -797,8 +1038,15 @@ def _preprocess_for_loso_fast(
     feature_cols: Optional[List[str]],
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    One-pass preprocessing for massive LOSO runs: datetime, clipping, time
-    features, covariates, and feature list assembly.
+    One-pass preprocessing for massive LOSO runs: datetime cleaning,
+    clipping, time features, covariates resolution and feature list.
+
+    Returns
+    -------
+    df : DataFrame
+        Preprocessed table.
+    feats : list of str
+        Feature columns to be used for training.
     """
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -862,7 +1110,28 @@ def evaluate_all_stations(
     parquet_compression: str = "snappy",
 ) -> pd.DataFrame:
     """
-    Classic LOSO: loop over stations without neighbor restriction.
+    Evaluate LOSO performance for all stations (naive loop, no neighbor
+    restriction).
+
+    Parameters
+    ----------
+    data : DataFrame
+    id_col, date_col, lat_col, lon_col, alt_col, target_col : str
+    rf_params : dict
+    agg_for_metrics : {"sum", "mean", "median"}
+    start, end : str
+    add_cyclic : bool
+    feature_cols : list of str or None
+    order_by : (str, bool), default ("RMSE_d", True)
+        Column name and ascending flag for sorting.
+    include_target_pct : float
+    include_target_seed : int
+    save_table_path : str or None
+
+    Returns
+    -------
+    DataFrame
+        Row per station with daily/monthly/annual metrics.
     """
     results: List[Dict] = []
     stations = data[id_col].dropna().unique()
@@ -976,17 +1245,47 @@ def evaluate_all_stations_fast(
     parquet_compression: str = "snappy",
 ) -> pd.DataFrame:
     """
-    Fast LOSO evaluation with single-pass preprocessing, optional neighbor
-    restriction, controlled target leakage, and station filtering by minimum
-    valid rows.
+    Fast LOSO evaluation with single-pass preprocessing and optional
+    neighbor restriction.
+
+    Parameters
+    ----------
+    data : DataFrame
+    id_col, date_col, lat_col, lon_col, alt_col, target_col : str
+    var_col, var_cols : str or iterable of str, optional
+        Additional covariate columns.
+    prefix, station_ids, regex, custom_filter :
+        See :func:`select_stations`.
+    start, end : str
+        Time window for both training and testing.
+    rf_params : dict
+    agg_for_metrics : {"sum", "mean", "median"}
+    add_cyclic : bool
+    feature_cols : list of str or None
+    k_neighbors : int or None
+    neighbor_map : dict or None
+    log_csv : str or None
+        If provided, appends station-level results as they are computed.
+    flush_every : int
+    show_progress : bool
+    include_target_pct : float
+    include_target_seed : int
+    min_station_rows : int or None
+        Minimum number of valid rows (features + target) required per station.
+    save_table_path : str or None
+
+    Returns
+    -------
+    DataFrame
+        Station-level metrics table.
     """
-    # back-compat: var_col -> var_cols
+    # Back-compat: var_col -> var_cols
     if var_cols is None and var_col is not None:
         var_cols = [var_col]
 
     t_all0 = time.time()
 
-    # preprocess once
+    # Single preprocessing pass
     df, feats = _preprocess_for_loso_fast(
         data,
         id_col=id_col,
@@ -1014,10 +1313,7 @@ def evaluate_all_stations_fast(
 
     if min_station_rows is not None:
         valid_counts = (
-            df.loc[valid_mask_global, [id_col]]
-            .groupby(id_col)
-            .size()
-            .astype(int)
+            df.loc[valid_mask_global, [id_col]].groupby(id_col).size().astype(int)
         )
         before_n = len(stations)
         stations = [
@@ -1059,7 +1355,7 @@ def evaluate_all_stations_fast(
         alt_med = float(st_block[alt_col].median()) if not st_block.empty else np.nan
 
         if k_neighbors is not None:
-            neigh = neighbor_map.get(sid, [])
+            neigh = (neighbor_map or {}).get(sid, [])
             is_train_pool = df[id_col].isin(neigh) & (~is_target)
         else:
             is_train_pool = ~is_target
@@ -1147,7 +1443,7 @@ def evaluate_all_stations_fast(
             warnings.filterwarnings(
                 "ignore",
                 category=DeprecationWarning,
-                message=".*is_sparse is deprecated.*",
+                message=r".*is_sparse is deprecated and will be removed in a future version.*",
             )
             model.fit(X_train, y_train)
             y_hat = model.predict(X_test)
@@ -1268,7 +1564,21 @@ def export_full_series_station(
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], str]:
     """
     Generate a full daily series for one station and save it to disk.
-    Optionally restrict training to k-neighbors around the target station.
+
+    Parameters
+    ----------
+    data : DataFrame
+    station_id : int
+    ...
+    out_dir : str, default "/kaggle/working/series"
+    file_format : {"parquet", "csv"}
+
+    Returns
+    -------
+    full_df : DataFrame
+    metrics : dict
+    path : str
+        Path where the series was saved.
     """
     df = data.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -1371,8 +1681,20 @@ def export_full_series_batch(
 ) -> pd.DataFrame:
     """
     Export full daily series for many stations (per-station files + manifest),
-    and optionally create a combined file in either "input_like" or "compact"
-    schema.
+    and optionally create a combined file.
+
+    Parameters
+    ----------
+    data : DataFrame
+    ...
+    combine_schema : {"input_like", "compact"}
+        - "input_like": (station, coords, date, target)
+        - "compact": (station, date, y_pred_full, y_true, target)
+
+    Returns
+    -------
+    manifest : DataFrame
+        One row per station with timing and metric information.
     """
     stations = select_stations(
         data,
@@ -1410,7 +1732,7 @@ def export_full_series_batch(
         t0 = time.time()
         try:
             if k_neighbors is not None:
-                neigh_ids = neighbor_map.get(sid, [])
+                neigh_ids = (neighbor_map or {}).get(sid, [])
                 df_train = data[data[id_col].isin(neigh_ids)]
                 df_test = data[data[id_col] == sid]
                 df_local = pd.concat([df_train, df_test], axis=0, copy=False)
@@ -1446,7 +1768,7 @@ def export_full_series_batch(
             else:
                 raise ValueError("file_format must be 'parquet' or 'csv'.")
 
-            # optional combined output
+            # Optional combined output
             if combine_output_path is not None:
                 st_coords = df_local[df_local[id_col] == sid]
                 lat0 = st_coords[lat_col].median() if lat_col in st_coords else np.nan
@@ -1605,14 +1927,16 @@ def loso_predict_full_series_fast(
     - Trains on all stations except the target (optionally only its k nearest
       neighbors).
     - Optionally includes a percentage of target rows in training
-      (include_target_pct).
+      (``include_target_pct``).
     - Predicts a continuous daily series [start, end] at the station's median
       coordinates.
-    - Returns (full_df, metrics, fitted_model, feature_cols).
+    - Returns ``(full_df, metrics, fitted_model, feature_cols)``.
 
-    full_df columns:
-        [date, station, y_pred_full, y_true?]
-    Metrics are computed only where y_true exists (safe R²).
+    Parameters
+    ----------
+    data : DataFrame
+    station_id : int
+    ...
     """
     # 1) Ensure datetime, and optionally clip a training window
     df = data.copy()
@@ -1638,7 +1962,7 @@ def loso_predict_full_series_fast(
             k=k_neighbors,
         )
 
-    # 3) Add time features and resolve covariates in ONE pass
+    # 3) Add time features and resolve covariates in one pass
     train_base["year"] = train_base[date_col].dt.year
     train_base["month"] = train_base[date_col].dt.month
     train_base["doy"] = train_base[date_col].dt.dayofyear
@@ -1656,7 +1980,7 @@ def loso_predict_full_series_fast(
     else:
         feats = list(feature_cols)
 
-    # 4) Training pool: all except target (or only its neighbors)
+    # 4) Training pool: all except target (or only neighbors)
     is_target = train_base[id_col] == station_id
     if k_neighbors is not None:
         neigh_ids = (neighbor_map or {}).get(station_id, [])
@@ -1666,7 +1990,7 @@ def loso_predict_full_series_fast(
 
     train_pool = train_base.loc[train_pool_mask]
 
-    # 5) Optional inclusion of target rows in training (from the train window)
+    # 5) Optional inclusion of target rows in training (from train window)
     pct = max(0.0, min(float(include_target_pct), 100.0))
     if pct > 0.0:
         tgt_rows = train_base.loc[is_target]
@@ -1705,7 +2029,7 @@ def loso_predict_full_series_fast(
         warnings.filterwarnings(
             "ignore",
             category=DeprecationWarning,
-            message=".*is_sparse is deprecated.*",
+            message=r".*is_sparse is deprecated and will be removed in a future version.*",
         )
         model.fit(X_train, y_train)
 
@@ -1823,11 +2147,17 @@ def plot_compare_obs_rf_nasa(
     extra_style: Optional[Dict] = None,
 ) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
     """
-    Plot Observed vs. RF vs. NASA with an optional fourth external series, and
-    report MAE/RMSE/R² (computed against Observed where available).
+    Plot Observed vs RF vs NASA (plus an optional fourth external series) and
+    report MAE/RMSE/R² against the observed values.
 
-    All series are aligned in time; metrics are computed via inner-join on the
-    datetime index wherever observations exist.
+    All series are aligned in time; metrics are computed on the temporal
+    intersection where observations exist.
+
+    Returns
+    -------
+    fig, ax : matplotlib Figure and Axes
+    metrics : dict
+        Nested mapping ``{"nasa": {...}, "rf": {...}, "extra": {...}}``.
     """
 
     # ------------------------ helpers ------------------------
@@ -1837,38 +2167,38 @@ def plot_compare_obs_rf_nasa(
             s = s.dt.tz_localize(None)
         return s
 
-    def _clip(df: pd.DataFrame, dcol: str) -> pd.DataFrame:
-        out = df.copy()
-        out[dcol] = _ensure_dt(out[dcol])
+    def _clip(df_: pd.DataFrame, dcol: str) -> pd.DataFrame:
+        out_ = df_.copy()
+        out_[dcol] = _ensure_dt(out_[dcol])
         if start or end:
-            lo = pd.to_datetime(start) if start else out[dcol].min()
-            hi = pd.to_datetime(end) if end else out[dcol].max()
-            out = out[(out[dcol] >= lo) & (out[dcol] <= hi)]
-        return out
+            lo_ = pd.to_datetime(start) if start else out_[dcol].min()
+            hi_ = pd.to_datetime(end) if end else out_[dcol].max()
+            out_ = out_[(out_[dcol] >= lo_) & (out_[dcol] <= hi_)]
+        return out_
 
     def _prep(series: pd.Series) -> pd.Series:
-        s = series.sort_index()
+        s_ = series.sort_index()
         if resample is not None:
             op = (agg or "mean").lower()
             if op == "sum":
-                s = s.resample(resample).sum()
+                s_ = s_.resample(resample).sum()
             elif op == "median":
-                s = s.resample(resample).median()
+                s_ = s_.resample(resample).median()
             else:
-                s = s.resample(resample).mean()
+                s_ = s_.resample(resample).mean()
         if smooth and isinstance(smooth, int) and smooth > 1:
-            s = s.rolling(smooth, min_periods=1, center=True).mean()
-        return s
+            s_ = s_.rolling(smooth, min_periods=1, center=True).mean()
+        return s_
 
     def _to_series(obj, dcol: str, vcol: Optional[str]) -> pd.Series:
-        """Resolve a DataFrame/Series/array into a pd.Series indexed by datetime."""
+        """Resolve a DataFrame/Series/array into a Series indexed by datetime."""
         if obj is None:
             return pd.Series(dtype=float)
         if isinstance(obj, pd.Series):
-            s = obj.copy()
-            if not isinstance(s.index, pd.DatetimeIndex):
+            s_ = obj.copy()
+            if not isinstance(s_.index, pd.DatetimeIndex):
                 raise ValueError("A plain Series must be datetime-indexed.")
-            return s.sort_index()
+            return s_.sort_index()
         if isinstance(obj, (list, np.ndarray)):
             return pd.Series(obj)
         if isinstance(obj, pd.DataFrame):
@@ -1884,34 +2214,6 @@ def plot_compare_obs_rf_nasa(
         raise TypeError(
             "Unsupported type for `extra`. Use DataFrame/Series/ndarray/list."
         )
-
-    def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
-        """
-        MAE/RMSE/R2 between two series, coercing to numpy.float64
-        and silencing the 'is_sparse is deprecated' warning locally.
-        """
-        pair = pd.concat([a, b], axis=1, join="inner").dropna()
-        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
-            return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
-
-        y_true = np.asarray(pair.iloc[:, 0].to_numpy(copy=False), dtype=float)
-        y_pred = np.asarray(pair.iloc[:, 1].to_numpy(copy=False), dtype=float)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=DeprecationWarning,
-                message=".*is_sparse is deprecated.*",
-            )
-            mae = mean_absolute_error(y_true, y_pred)
-            rmse = mean_squared_error(y_true, y_pred, squared=False)
-            r2 = (
-                r2_score(y_true, y_pred)
-                if y_true.size >= 2 and np.var(y_true) > 0
-                else np.nan
-            )
-
-        return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
     # ------------------------ base selection ------------------------
     base = data.copy()
@@ -1965,6 +2267,20 @@ def plot_compare_obs_rf_nasa(
         if isinstance(extra_series.index, pd.DatetimeIndex):
             series["extra"] = extra_series.sort_index()
             labels["extra"] = extra_label
+
+    def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
+        pair = pd.concat([a, b], axis=1, join="inner").dropna()
+        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
+            return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
+        return {
+            "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
+            "RMSE": mean_squared_error(
+                pair.iloc[:, 0],
+                pair.iloc[:, 1],
+                squared=False,
+            ),
+            "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
+        }
 
     # ------------------------ resample / smooth ------------------------
     for k in list(series.keys()):
