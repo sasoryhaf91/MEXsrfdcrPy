@@ -89,7 +89,6 @@ def set_warning_policy(silence: bool = True) -> None:
             category=DeprecationWarning,
             module=r"pandas\.core\.algorithms",
         )
-        # Filtro explícito para el mensaje 'is_sparse is deprecated'
         warnings.filterwarnings(
             "ignore",
             category=DeprecationWarning,
@@ -274,15 +273,24 @@ def _safe_metrics(
 ) -> Dict[str, float]:
     """
     Compute MAE, RMSE, and R² safely: R² is NaN when n<2 or zero variance.
+    Inputs are converted to numpy.float64 and we locally silence the
+    'is_sparse is deprecated' warning in case sklearn inspects dtypes.
     """
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-    if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
-        r2 = r2_score(y_true, y_pred)
-    else:
-        r2 = np.nan
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=".*is_sparse is deprecated.*",
+        )
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = mean_squared_error(y_true, y_pred, squared=False)
+        if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
+            r2 = r2_score(y_true, y_pred)
+        else:
+            r2 = np.nan
     return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
 
@@ -593,11 +601,10 @@ def loso_train_predict_station(
     if train_df.empty:
         raise ValueError("Training set is empty after filtering.")
 
-    # Force dense float64 arrays to avoid pandas SparseDtype / is_sparse warnings
-    X_train = np.asarray(train_df[feature_cols].to_numpy(copy=False), dtype=float)
-    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
-    X_test = np.asarray(test_df[feature_cols].to_numpy(copy=False), dtype=float)
-    y_test = np.asarray(test_df[target_col].to_numpy(copy=False), dtype=float)
+    X_train = train_df[feature_cols].to_numpy(copy=False)
+    y_train = train_df[target_col].to_numpy(copy=False)
+    X_test = test_df[feature_cols].to_numpy(copy=False)
+    y_test = test_df[target_col].to_numpy(copy=False)
 
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
@@ -702,10 +709,7 @@ def loso_predict_full_series(
         raise ValueError("Training set is empty after filtering.")
 
     model = RandomForestRegressor(**rf_params)
-
-    X_train = np.asarray(train_df[feature_cols].to_numpy(copy=False), dtype=float)
-    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
-    model.fit(X_train, y_train)
+    model.fit(train_df[feature_cols], train_df[target_col])
 
     dates = pd.date_range(
         start=pd.to_datetime(start),
@@ -723,9 +727,7 @@ def loso_predict_full_series(
     )
     synth = add_time_features(synth, date_col, add_cyclic=add_cyclic)
 
-    X_synth = np.asarray(synth[feature_cols].to_numpy(copy=False), dtype=float)
-    y_pred_full = model.predict(X_synth)
-
+    y_pred_full = model.predict(synth[feature_cols])
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -1135,14 +1137,20 @@ def evaluate_all_stations_fast(
                 tqdm.write(f"Station {sid}: empty train (skipped)")
             continue
 
-        X_train = np.asarray(train_df[feats].to_numpy(copy=False), dtype=float)
-        y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
-        X_test = np.asarray(test_df[feats].to_numpy(copy=False), dtype=float)
-        y_test = np.asarray(test_df[target_col].to_numpy(copy=False), dtype=float)
+        X_train = train_df[feats].to_numpy(copy=False)
+        y_train = train_df[target_col].to_numpy(copy=False)
+        X_test = test_df[feats].to_numpy(copy=False)
+        y_test = test_df[target_col].to_numpy(copy=False)
 
         model = RandomForestRegressor(**rf_params)
-        model.fit(X_train, y_train)
-        y_hat = model.predict(X_test)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=DeprecationWarning,
+                message=".*is_sparse is deprecated.*",
+            )
+            model.fit(X_train, y_train)
+            y_hat = model.predict(X_test)
 
         df_pred = pd.DataFrame(
             {
@@ -1471,9 +1479,7 @@ def export_full_series_batch(
                         part["y_true"].notna(),
                         part["y_pred_full"],
                     )
-                    part = part[
-                        ["station", "y_pred_full", "y_true", date_col, target_col]
-                    ]
+                    part = part[["station", "y_pred_full", "y_true", date_col, target_col]]
                 else:  # pragma: no cover
                     raise ValueError(
                         "combine_schema must be 'input_like' or 'compact'."
@@ -1693,9 +1699,15 @@ def loso_predict_full_series_fast(
 
     # 7) Fit model
     model = RandomForestRegressor(**rf_params)
-    X_train = np.asarray(train_df[feats].to_numpy(copy=False), dtype=float)
-    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
-    model.fit(X_train, y_train)
+    X_train = train_df[feats].to_numpy(copy=False)
+    y_train = train_df[target_col].to_numpy(copy=False)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=".*is_sparse is deprecated.*",
+        )
+        model.fit(X_train, y_train)
 
     # 8) Predict full continuous daily series on [start, end]
     dates = pd.date_range(
@@ -1719,8 +1731,7 @@ def loso_predict_full_series_fast(
         synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
         synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
 
-    X_synth = np.asarray(synth[feats].to_numpy(copy=False), dtype=float)
-    y_pred_full = model.predict(X_synth)
+    y_pred_full = model.predict(synth[feats])
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -1874,6 +1885,34 @@ def plot_compare_obs_rf_nasa(
             "Unsupported type for `extra`. Use DataFrame/Series/ndarray/list."
         )
 
+    def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
+        """
+        MAE/RMSE/R2 between two series, coercing to numpy.float64
+        and silencing the 'is_sparse is deprecated' warning locally.
+        """
+        pair = pd.concat([a, b], axis=1, join="inner").dropna()
+        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
+            return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
+
+        y_true = np.asarray(pair.iloc[:, 0].to_numpy(copy=False), dtype=float)
+        y_pred = np.asarray(pair.iloc[:, 1].to_numpy(copy=False), dtype=float)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=DeprecationWarning,
+                message=".*is_sparse is deprecated.*",
+            )
+            mae = mean_absolute_error(y_true, y_pred)
+            rmse = mean_squared_error(y_true, y_pred, squared=False)
+            r2 = (
+                r2_score(y_true, y_pred)
+                if y_true.size >= 2 and np.var(y_true) > 0
+                else np.nan
+            )
+
+        return {"MAE": mae, "RMSE": rmse, "R2": r2}
+
     # ------------------------ base selection ------------------------
     base = data.copy()
     if id_col in base.columns:
@@ -1926,20 +1965,6 @@ def plot_compare_obs_rf_nasa(
         if isinstance(extra_series.index, pd.DatetimeIndex):
             series["extra"] = extra_series.sort_index()
             labels["extra"] = extra_label
-
-    def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
-        pair = pd.concat([a, b], axis=1, join="inner").dropna()
-        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
-            return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
-        return {
-            "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
-            "RMSE": mean_squared_error(
-                pair.iloc[:, 0],
-                pair.iloc[:, 1],
-                squared=False,
-            ),
-            "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
-        }
 
     # ------------------------ resample / smooth ------------------------
     for k in list(series.keys()):
