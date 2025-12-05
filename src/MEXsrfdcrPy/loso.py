@@ -2055,7 +2055,8 @@ def loso_predict_full_series_fast(
         synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
         synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
 
-    y_pred_full = model.predict(synth[feats])
+    #y_pred_full = model.predict(synth[feats])
+    y_pred_full = model.predict(synth[feats].to_numpy(copy=False))
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
