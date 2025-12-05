@@ -89,6 +89,12 @@ def set_warning_policy(silence: bool = True) -> None:
             category=DeprecationWarning,
             module=r"pandas\.core\.algorithms",
         )
+        # Filtro explícito para el mensaje 'is_sparse is deprecated'
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=".*is_sparse is deprecated.*",
+        )
 
         # Métricas indefinidas (R2 con varianza cero, etc.)
         try:
@@ -587,10 +593,11 @@ def loso_train_predict_station(
     if train_df.empty:
         raise ValueError("Training set is empty after filtering.")
 
-    X_train = train_df[feature_cols].to_numpy(copy=False)
-    y_train = train_df[target_col].to_numpy(copy=False)
-    X_test = test_df[feature_cols].to_numpy(copy=False)
-    y_test = test_df[target_col].to_numpy(copy=False)
+    # Force dense float64 arrays to avoid pandas SparseDtype / is_sparse warnings
+    X_train = np.asarray(train_df[feature_cols].to_numpy(copy=False), dtype=float)
+    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
+    X_test = np.asarray(test_df[feature_cols].to_numpy(copy=False), dtype=float)
+    y_test = np.asarray(test_df[target_col].to_numpy(copy=False), dtype=float)
 
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
@@ -695,7 +702,10 @@ def loso_predict_full_series(
         raise ValueError("Training set is empty after filtering.")
 
     model = RandomForestRegressor(**rf_params)
-    model.fit(train_df[feature_cols], train_df[target_col])
+
+    X_train = np.asarray(train_df[feature_cols].to_numpy(copy=False), dtype=float)
+    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
+    model.fit(X_train, y_train)
 
     dates = pd.date_range(
         start=pd.to_datetime(start),
@@ -713,7 +723,9 @@ def loso_predict_full_series(
     )
     synth = add_time_features(synth, date_col, add_cyclic=add_cyclic)
 
-    y_pred_full = model.predict(synth[feature_cols])
+    X_synth = np.asarray(synth[feature_cols].to_numpy(copy=False), dtype=float)
+    y_pred_full = model.predict(X_synth)
+
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -1123,10 +1135,10 @@ def evaluate_all_stations_fast(
                 tqdm.write(f"Station {sid}: empty train (skipped)")
             continue
 
-        X_train = train_df[feats].to_numpy(copy=False)
-        y_train = train_df[target_col].to_numpy(copy=False)
-        X_test = test_df[feats].to_numpy(copy=False)
-        y_test = test_df[target_col].to_numpy(copy=False)
+        X_train = np.asarray(train_df[feats].to_numpy(copy=False), dtype=float)
+        y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
+        X_test = np.asarray(test_df[feats].to_numpy(copy=False), dtype=float)
+        y_test = np.asarray(test_df[target_col].to_numpy(copy=False), dtype=float)
 
         model = RandomForestRegressor(**rf_params)
         model.fit(X_train, y_train)
@@ -1459,7 +1471,9 @@ def export_full_series_batch(
                         part["y_true"].notna(),
                         part["y_pred_full"],
                     )
-                    part = part[["station", "y_pred_full", "y_true", date_col, target_col]]
+                    part = part[
+                        ["station", "y_pred_full", "y_true", date_col, target_col]
+                    ]
                 else:  # pragma: no cover
                     raise ValueError(
                         "combine_schema must be 'input_like' or 'compact'."
@@ -1679,8 +1693,8 @@ def loso_predict_full_series_fast(
 
     # 7) Fit model
     model = RandomForestRegressor(**rf_params)
-    X_train = train_df[feats].to_numpy(copy=False)
-    y_train = train_df[target_col].to_numpy(copy=False)
+    X_train = np.asarray(train_df[feats].to_numpy(copy=False), dtype=float)
+    y_train = np.asarray(train_df[target_col].to_numpy(copy=False), dtype=float)
     model.fit(X_train, y_train)
 
     # 8) Predict full continuous daily series on [start, end]
@@ -1705,7 +1719,8 @@ def loso_predict_full_series_fast(
         synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
         synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
 
-    y_pred_full = model.predict(synth[feats])
+    X_synth = np.asarray(synth[feats].to_numpy(copy=False), dtype=float)
+    y_pred_full = model.predict(X_synth)
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
