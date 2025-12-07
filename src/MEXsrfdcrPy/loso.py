@@ -3,20 +3,19 @@
 LOSO (Leave-One-Station-Out) Toolkit
 ====================================
 
-This module provides a compact, production-ready implementation of LOSO
-validation for daily climate records reconstruction with Random Forests. It
-supports:
+Tools for spatial–temporal reconstruction of daily climate station records
+using Random Forests and LOSO-style validation.
 
-- Strict LOSO or partial inclusion of the target station in training via
-  ``include_target_pct``.
-- Station-wise training/prediction on observed days and full-series prediction.
-- Fast evaluation across many stations with optional neighbor-based acceleration.
-- Flexible feature space: coordinates + calendar + optional covariates.
-- Robust metrics (MAE/RMSE/R²) with safe R² and resampling aliases.
-- Station filtering by minimum valid rows (``min_station_rows``).
-- Neighbor discovery (KDTree) and station–neighbor correlation tables.
-- Batch export of full daily series (per-station files + optional combined
-  output).
+This module focuses on:
+
+- Strict LOSO or controlled leakage via ``include_target_pct``.
+- Station-wise training and prediction on observed days.
+- Full-series prediction for arbitrary [start, end] periods.
+- Fast evaluation across many stations with optional neighbor restriction.
+- Robust metrics (MAE/RMSE/R²) with safe handling of edge cases.
+- Station filtering by minimum valid rows.
+- Neighbor discovery (KDTree) and correlation tables.
+- Batch export of per-station full daily series.
 - Comparison plots (Observed vs RF vs external/NASA) helper.
 
 Runtime dependencies
@@ -28,7 +27,8 @@ Runtime dependencies
 
 Optional
 --------
-- geopandas, folium (only for maps in downstream modules)
+- tqdm (for progress bars)
+- geopandas, folium (only in downstream code, not required here)
 """
 
 from __future__ import annotations
@@ -38,7 +38,17 @@ import os
 import re
 import time
 import warnings
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -46,16 +56,25 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import DatetimeTZDtype
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import r2_score
 from sklearn.neighbors import KDTree
 
-try:
-    # Optional progress bar
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover
+# ---------------------------------------------------------------------
+# Optional tqdm (progress bar)
+# ---------------------------------------------------------------------
 
-    def tqdm(x, **kwargs):
+try:  # pragma: no cover - cosmetic optional dependency
+    from tqdm.auto import tqdm as _tqdm
+except Exception:  # pragma: no cover
+    from typing import TypeVar
+
+    T = TypeVar("T")
+
+    def _tqdm(x: Iterable[T], **_: object) -> Iterable[T]:
+        """Fallback tqdm that simply returns the iterable unchanged."""
         return x
+
+tqdm = _tqdm  # public alias
 
 
 # ---------------------------------------------------------------------
@@ -75,16 +94,7 @@ def set_warning_policy(silence: bool = True) -> None:
         - The noisy ``is_sparse is deprecated`` DeprecationWarning emitted
           by ``sklearn.utils.validation``.
         - ``UndefinedMetricWarning`` (e.g., R² with zero variance).
-
-    Notes
-    -----
-    The filters are intentionally narrow for the sklearn deprecation:
-    they match by message content rather than module only, to survive
-    changes in the internal module path, while avoiding silencing
-    unrelated deprecations.
     """
-    # Reset then re-apply filters so that notebook/global config does not
-    # override our intent.
     warnings.resetwarnings()
 
     if not silence:
@@ -100,16 +110,14 @@ def set_warning_policy(silence: bool = True) -> None:
         message=r".*is_sparse is deprecated and will be removed in a future version.*",
     )
 
-    # Some environments phrase the message slightly differently; keep a
-    # second, more generic pattern.
+    # Some environments phrase the message slightly differently.
     warnings.filterwarnings(
         "ignore",
         category=DeprecationWarning,
         message=r".*pd\.SparseDtype.*",
     )
 
-    # Optionally, silence deprecations coming from pandas algorithms
-    # (this covers dtype-related warnings that are not actionable here).
+    # Pandas algorithms deprecations that are not actionable here.
     warnings.filterwarnings(
         "ignore",
         category=DeprecationWarning,
@@ -117,11 +125,11 @@ def set_warning_policy(silence: bool = True) -> None:
     )
 
     # Metrics warnings (e.g. R² undefined when y_true has zero variance).
-    try:
+    try:  # pragma: no cover - optional import
         from sklearn.exceptions import UndefinedMetricWarning
 
         warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-    except Exception:  # pragma: no cover
+    except Exception:
         pass
 
 
@@ -135,6 +143,7 @@ set_warning_policy(True)
 
 
 def _ensure_parent_dir(path: Optional[str]) -> None:
+    """Create parent directory for ``path`` if needed."""
     if not path:
         return
     d = os.path.dirname(str(path)) or "."
@@ -186,14 +195,14 @@ def _save_df(
     return path
 
 
-def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
+def _save_json(obj: Mapping[str, object], path: Optional[str]) -> Optional[str]:
     """
     Save a JSON-serializable object to disk.
 
     Parameters
     ----------
-    obj : dict
-        JSON-serializable object.
+    obj : mapping
+        JSON-serializable dictionary.
     path : str or None
         Output path. If None, nothing is saved and None is returned.
 
@@ -215,14 +224,14 @@ def _save_json(obj: dict, path: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------
 
 
-def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
+def _resolve_columns(df: pd.DataFrame, cols: Optional[Union[str, Sequence[str]]]) -> List[str]:
     """
     Internal helper: resolve column names case-insensitively, with aliases.
 
     Parameters
     ----------
     df : DataFrame
-    cols : str or iterable of str
+    cols : str or iterable of str or None
 
     Returns
     -------
@@ -234,7 +243,7 @@ def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     if isinstance(cols, str):
         cols = [cols]
 
-    lower_map = {c.lower(): c for c in df.columns}
+    lower_map: Dict[str, str] = {c.lower(): c for c in df.columns}
     aliases = {
         "pretotcorr": "prectotcorr",
     }
@@ -250,7 +259,7 @@ def _resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     return resolved
 
 
-def resolve_columns(df: pd.DataFrame, cols) -> List[str]:
+def resolve_columns(df: pd.DataFrame, cols: Optional[Union[str, Sequence[str]]]) -> List[str]:
     """
     Public variant of ``_resolve_columns``.
 
@@ -259,7 +268,7 @@ def resolve_columns(df: pd.DataFrame, cols) -> List[str]:
     Parameters
     ----------
     df : DataFrame
-    cols : str or iterable of str
+    cols : str or iterable of str or None
 
     Returns
     -------
@@ -327,8 +336,8 @@ def add_time_features(
     out["month"] = out[date_col].dt.month
     out["doy"] = out[date_col].dt.dayofyear
     if add_cyclic:
-        out["doy_sin"] = np.sin(2 * np.pi * out["doy"] / 365.25)
-        out["doy_cos"] = np.cos(2 * np.pi * out["doy"] / 365.25)
+        out["doy_sin"] = np.sin(2.0 * np.pi * out["doy"].to_numpy(dtype=float) / 365.25)
+        out["doy_cos"] = np.cos(2.0 * np.pi * out["doy"].to_numpy(dtype=float) / 365.25)
     return out
 
 
@@ -336,7 +345,7 @@ def add_time_features(
 # Metrics and aggregation (safe R²; resampling aliases)
 # ---------------------------------------------------------------------
 
-_FREQ_ALIAS = {"M": "ME", "A": "YE", "Y": "YE", "Q": "QE"}
+_FREQ_ALIAS: Dict[str, str] = {"M": "ME", "A": "YE", "Y": "YE", "Q": "QE"}
 
 
 def _safe_metrics(
@@ -346,8 +355,15 @@ def _safe_metrics(
     """
     Compute MAE, RMSE and R² in a robust way.
 
-    - R² is set to NaN when the variance of ``y_true`` is zero or when
-      there are fewer than 2 observations.
+    Notes
+    -----
+    - MAE and RMSE are computed explicitly (no dependency on sklearn
+      ``squared=`` argument).
+    - R² is set to:
+        * 1.0 when the series is constant and predictions are identical.
+        * NaN when there are no observations or constant-but-mismatched
+          predictions.
+        * Standard sklearn R² otherwise.
 
     Parameters
     ----------
@@ -358,14 +374,29 @@ def _safe_metrics(
     dict
         Keys: ``{"MAE", "RMSE", "R2"}``.
     """
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-    if y_true.size >= 2 and float(np.var(y_true)) > 0.0:
-        r2 = r2_score(y_true, y_pred)
+    yt = np.asarray(list(y_true), dtype=float)
+    yp = np.asarray(list(y_pred), dtype=float)
+
+    if yt.size == 0:
+        return {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
+
+    diff = yt - yp
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(np.mean(diff * diff)))
+
+    var = float(np.var(yt))
+    if var == 0.0:
+        # Constant series: define perfect prediction as R² = 1.0, otherwise NaN.
+        if np.allclose(yt, yp, equal_nan=False):
+            r2 = 1.0
+        else:
+            r2 = np.nan
+    elif yt.size < 2:
+        # Not strictly reachable with var > 0, but kept for completeness.
+        r2 = 1.0 if np.allclose(yt, yp, equal_nan=False) else np.nan
     else:
-        r2 = np.nan
+        r2 = float(r2_score(yt, yp))
+
     return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
 
@@ -402,7 +433,10 @@ def aggregate_and_score(
         Aggregated series with the same columns.
     """
     freq = _FREQ_ALIAS.get(freq, freq)
-    aggfunc = {"sum": "sum", "mean": "mean", "median": "median"}[agg]
+    aggfunc_map: Dict[str, str] = {"sum": "sum", "mean": "mean", "median": "median"}
+    if agg not in aggfunc_map:
+        raise ValueError("agg must be one of {'sum', 'mean', 'median'}")
+    aggfunc = aggfunc_map[agg]
 
     df = df_pred[[date_col, y_col, yhat_col]].dropna(subset=[date_col]).copy()
     if df.empty:
@@ -426,7 +460,7 @@ def select_stations(
     data: pd.DataFrame,
     *,
     id_col: str = "station",
-    prefix: Optional[Iterable[str] | str] = None,
+    prefix: Optional[Union[Iterable[str], str]] = None,
     station_ids: Optional[Iterable[int]] = None,
     regex: Optional[str] = None,
     custom_filter: Optional[Callable[[int], bool]] = None,
@@ -458,13 +492,16 @@ def select_stations(
     chosen: set[int] = set()
 
     if prefix is not None:
+        pref_list: Iterable[str]
         if isinstance(prefix, str):
-            prefix = [prefix]
-        for p in prefix:
+            pref_list = [prefix]
+        else:
+            pref_list = prefix
+        for p in pref_list:
             chosen.update([i for i in ids if str(i).startswith(str(p))])
 
     if station_ids is not None:
-        chosen.update([int(i) for i in station_ids])
+        chosen.update(int(i) for i in station_ids)
 
     if regex is not None:
         pat = re.compile(regex)
@@ -508,14 +545,15 @@ def build_station_kneighbors(
         .rename(columns={lat_col: "lat", lon_col: "lon"})
         .reset_index()
     )
-    X = np.deg2rad(centroids[["lat", "lon"]].values)
+    coords = centroids[["lat", "lon"]].to_numpy(dtype=float)
+    X = np.deg2rad(coords)
     tree = KDTree(X, metric="euclidean")
     _, idx = tree.query(X, k=min(k + 1, len(centroids)))
     neighbors: Dict[int, List[int]] = {}
     ids = centroids[id_col].tolist()
     for i, st in enumerate(ids):
         neigh_idx = idx[i][1:]  # exclude itself
-        neighbors[st] = centroids.iloc[neigh_idx][id_col].tolist()
+        neighbors[int(st)] = centroids.iloc[neigh_idx][id_col].astype(int).tolist()
     return neighbors
 
 
@@ -571,7 +609,7 @@ def neighbor_correlation_table(
         hi = pd.to_datetime(end) if end else df[date_col].max()
         df = df[(df[date_col] >= lo) & (df[date_col] <= hi)]
 
-    ids_needed = set([int(station_id)] + [int(x) for x in neighbor_ids])
+    ids_needed = {int(station_id), *[int(x) for x in neighbor_ids]}
     df = df[df[id_col].isin(ids_needed)]
 
     wide = df.pivot_table(
@@ -582,7 +620,7 @@ def neighbor_correlation_table(
     )
     try:
         wide.columns = wide.columns.astype(int)
-    except Exception:  # pragma: no cover
+    except Exception:  # pragma: no cover - defensive cast
         pass
 
     if station_id not in wide.columns:
@@ -591,22 +629,24 @@ def neighbor_correlation_table(
         return res
 
     s_main = wide[station_id]
-    rows = []
+    rows: List[Dict[str, float]] = []
     for nid in neighbor_ids:
-        if nid not in wide.columns:
-            rows.append({"neighbor": int(nid), "corr": np.nan, "n_overlap": 0})
+        nid_int = int(nid)
+        if nid_int not in wide.columns:
+            rows.append({"neighbor": nid_int, "corr": np.nan, "n_overlap": 0})
             continue
-        pair = pd.concat([s_main, wide[nid]], axis=1, join="inner").dropna()
+        pair = pd.concat([s_main, wide[nid_int]], axis=1, join="inner").dropna()
         n = int(len(pair))
         if n < min_overlap:
             corr = np.nan
         else:
-            a, b = pair.iloc[:, 0].values, pair.iloc[:, 1].values
-            if np.std(a) == 0 or np.std(b) == 0:
+            a = pair.iloc[:, 0].to_numpy(dtype=float)
+            b = pair.iloc[:, 1].to_numpy(dtype=float)
+            if np.std(a) == 0.0 or np.std(b) == 0.0:
                 corr = np.nan
             else:
                 corr = float(np.corrcoef(a, b)[0, 1])
-        rows.append({"neighbor": int(nid), "corr": corr, "n_overlap": n})
+        rows.append({"neighbor": nid_int, "corr": corr, "n_overlap": n})
 
     res = (
         pd.DataFrame(rows)
@@ -626,7 +666,7 @@ def sample_target_for_training(
     df: pd.DataFrame,
     *,
     id_col: str,
-    date_col: str,  # kept for API symmetry (not used here but may be useful)
+    date_col: str,  # kept for API symmetry; not used in sampling logic
     target_col: str,
     feature_cols: List[str],
     station_id: int,
@@ -663,8 +703,8 @@ def sample_target_for_training(
         return df.iloc[0:0].copy()
 
     df_t = df[df[id_col] == station_id].copy()
-    ok = (~df_t[target_col].isna()) & (~df_t[feature_cols].isna().any(axis=1))
-    df_t = df_t.loc[ok]
+    ok_mask = (~df_t[target_col].isna()) & (~df_t[feature_cols].isna().any(axis=1))
+    df_t = df_t.loc[ok_mask]
     if df_t.empty:
         return df_t
 
@@ -692,8 +732,8 @@ def loso_train_predict_station(
     feature_cols: Optional[List[str]] = None,
     add_cyclic: bool = False,
     # model
-    model=None,
-    rf_params: Optional[Dict] = None,
+    model: Optional[RandomForestRegressor] = None,
+    rf_params: Optional[Dict[str, object]] = None,
     # metrics
     agg_for_metrics: str = "sum",
     # period
@@ -706,7 +746,7 @@ def loso_train_predict_station(
     save_predictions_path: Optional[str] = None,
     save_metrics_path: Optional[str] = None,
     parquet_compression: str = "snappy",
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], RandomForestRegressor, List[str]]:
     """
     Classic LOSO for a single station on observed days only.
 
@@ -726,7 +766,7 @@ def loso_train_predict_station(
         If None, defaults to::
             [lat_col, lon_col, alt_col, "year", "month", "doy"] (+ cyclic terms).
     add_cyclic : bool, default False
-    model : scikit-learn regressor or None, default None
+    model : RandomForestRegressor or None, default None
         If None, a new RandomForestRegressor is created from ``rf_params``.
     rf_params : dict or None
     agg_for_metrics : {"sum", "mean", "median"}
@@ -745,7 +785,7 @@ def loso_train_predict_station(
         Columns: [date_col, "station", "y_true", "y_pred"].
     metrics : dict
         ``{"daily": {...}, "monthly": {...}, "annual": {...}}``.
-    model : object
+    model : RandomForestRegressor
         Fitted model.
     feature_cols : list of str
         The feature columns actually used.
@@ -800,8 +840,6 @@ def loso_train_predict_station(
     y_test = test_df[target_col].to_numpy(copy=False)
 
     with warnings.catch_warnings():
-        # Extra safety: silence is_sparse warnings inside fit/predict even if
-        # global filters were changed externally.
         warnings.filterwarnings(
             "ignore",
             category=DeprecationWarning,
@@ -857,7 +895,7 @@ def loso_predict_full_series(
     target_col: str = "prec",
     start: str = "1961-01-01",
     end: str = "2023-12-31",
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=200,
         max_depth=None,
         random_state=42,
@@ -870,7 +908,7 @@ def loso_predict_full_series(
     save_series_path: Optional[str] = None,
     save_metrics_path: Optional[str] = None,
     parquet_compression: str = "snappy",
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], RandomForestRegressor, List[str]]:
     """
     Train (LOSO or partial leakage) and predict a full daily series [start, end]
     for a single station.
@@ -897,7 +935,7 @@ def loso_predict_full_series(
     full_df : DataFrame
         Columns: [date, "station", "y_pred_full", "y_true?"].
     metrics : dict
-    model : object
+    model : RandomForestRegressor
     feature_cols : list of str
     """
     df = ensure_datetime(data, date_col)
@@ -905,9 +943,9 @@ def loso_predict_full_series(
     st = df[df[id_col] == station_id]
     if st.empty:
         raise ValueError(f"No rows for station {station_id}.")
-    lat0 = st[lat_col].median()
-    lon0 = st[lon_col].median()
-    alt0 = st[alt_col].median()
+    lat0 = float(st[lat_col].median())
+    lon0 = float(st[lon_col].median())
+    alt0 = float(st[alt_col].median())
 
     train_df = add_time_features(df.copy(), date_col, add_cyclic=add_cyclic)
 
@@ -933,6 +971,9 @@ def loso_predict_full_series(
     if train_df.empty:
         raise ValueError("Training set is empty after filtering.")
 
+    X_train = train_df[feature_cols].to_numpy(copy=False)
+    y_train = train_df[target_col].to_numpy(copy=False)
+
     model = RandomForestRegressor(**rf_params)
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -940,7 +981,7 @@ def loso_predict_full_series(
             category=DeprecationWarning,
             message=r".*is_sparse is deprecated and will be removed in a future version.*",
         )
-        model.fit(train_df[feature_cols], train_df[target_col])
+        model.fit(X_train, y_train)
 
     dates = pd.date_range(
         start=pd.to_datetime(start),
@@ -958,7 +999,8 @@ def loso_predict_full_series(
     )
     synth = add_time_features(synth, date_col, add_cyclic=add_cyclic)
 
-    y_pred_full = model.predict(synth[feature_cols])
+    X_synth = synth[feature_cols].to_numpy(copy=False)
+    y_pred_full = model.predict(X_synth)
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -999,8 +1041,8 @@ def loso_predict_full_series(
 
 
 def _append_rows_to_csv(
-    rows: List[Dict],
-    path: str,
+    rows: List[Mapping[str, object]],
+    path: Optional[str],
     *,
     header_written_flag: Dict[str, bool],
 ) -> None:
@@ -1010,13 +1052,13 @@ def _append_rows_to_csv(
     Parameters
     ----------
     rows : list of dict
-    path : str
+    path : str or None
     header_written_flag : dict
         Mutable state tracking whether the header has been written.
     """
     if not rows or path is None:
         return
-    df_tmp = pd.DataFrame(rows)
+    df_tmp = pd.DataFrame(list(rows))
     first = not os.path.exists(path) and not header_written_flag.get(path, False)
     df_tmp.to_csv(path, mode="a", index=False, header=first)
     header_written_flag[path] = True
@@ -1063,22 +1105,20 @@ def _preprocess_for_loso_fast(
     df["month"] = df[date_col].dt.month
     df["doy"] = df[date_col].dt.dayofyear
     if add_cyclic:
-        df["doy_sin"] = np.sin(2 * np.pi * df["doy"] / 365.25)
-        df["doy_cos"] = np.cos(2 * np.pi * df["doy"] / 365.25)
+        df["doy_sin"] = np.sin(2.0 * np.pi * df["doy"].to_numpy(dtype=float) / 365.25)
+        df["doy_cos"] = np.cos(2.0 * np.pi * df["doy"].to_numpy(dtype=float) / 365.25)
 
     resolved_vars = resolve_columns(df, var_cols)
 
     if feature_cols is None:
-        feats = [lat_col, lon_col, alt_col, "year", "month", "doy"]
+        feats: List[str] = [lat_col, lon_col, alt_col, "year", "month", "doy"]
         if add_cyclic:
             feats += ["doy_sin", "doy_cos"]
         feats += resolved_vars
     else:
         feats = list(feature_cols)
 
-    keep = sorted(
-        set([id_col, date_col, lat_col, lon_col, alt_col, target_col] + feats)
-    )
+    keep = sorted(set([id_col, date_col, lat_col, lon_col, alt_col, target_col] + feats))
     df = df[keep]
     return df, feats
 
@@ -1092,7 +1132,7 @@ def evaluate_all_stations(
     lon_col: str = "longitude",
     alt_col: str = "altitude",
     target_col: str = "prec",
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=300,
         max_depth=30,
         random_state=42,
@@ -1133,14 +1173,15 @@ def evaluate_all_stations(
     DataFrame
         Row per station with daily/monthly/annual metrics.
     """
-    results: List[Dict] = []
+    results: List[Dict[str, object]] = []
     stations = data[id_col].dropna().unique()
 
     for st in stations:
+        st_int = int(st)
         try:
             out_df, metrics, _, _ = loso_train_predict_station(
                 data,
-                station_id=int(st),
+                station_id=st_int,
                 id_col=id_col,
                 date_col=date_col,
                 lat_col=lat_col,
@@ -1158,8 +1199,8 @@ def evaluate_all_stations(
             )
             results.append(
                 {
-                    "station": int(st),
-                    "n_rows": len(out_df),
+                    "station": st_int,
+                    "n_rows": int(len(out_df)),
                     "MAE_d": metrics["daily"]["MAE"],
                     "RMSE_d": metrics["daily"]["RMSE"],
                     "R2_d": metrics["daily"]["R2"],
@@ -1174,7 +1215,7 @@ def evaluate_all_stations(
         except Exception:
             results.append(
                 {
-                    "station": int(st),
+                    "station": st_int,
                     "n_rows": 0,
                     "MAE_d": np.nan,
                     "RMSE_d": np.nan,
@@ -1212,7 +1253,7 @@ def evaluate_all_stations_fast(
     var_cols: Optional[Iterable[str]] = None,
     target_col: str = "prec",
     # selection
-    prefix: Optional[Iterable[str]] = None,
+    prefix: Optional[Union[Iterable[str], str]] = None,
     station_ids: Optional[Iterable[int]] = None,
     regex: Optional[str] = None,
     custom_filter: Optional[Callable[[int], bool]] = None,
@@ -1220,7 +1261,7 @@ def evaluate_all_stations_fast(
     start: str = "1961-01-01",
     end: str = "2023-12-31",
     # model
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=100,
         max_depth=None,
         random_state=42,
@@ -1322,9 +1363,10 @@ def evaluate_all_stations_fast(
             if int(valid_counts.get(s, 0)) >= int(min_station_rows)
         ]
         if show_progress:
-            tqdm.write(
-                f"Filtered by min_station_rows={min_station_rows}: "
-                f"{before_n} → {len(stations)} stations"
+            tqdm(
+                [],
+                desc=f"Filtered by min_station_rows={min_station_rows}: "
+                f"{before_n} → {len(stations)} stations",
             )
 
     if k_neighbors is not None and neighbor_map is None:
@@ -1337,9 +1379,10 @@ def evaluate_all_stations_fast(
         )
 
     header_flag: Dict[str, bool] = {}
-    rows: List[Dict] = []
-    pending: List[Dict] = []
-    iterator = (
+    rows: List[Dict[str, object]] = []
+    pending: List[Dict[str, object]] = []
+
+    iterator: Iterable[int] = (
         tqdm(stations, desc="Evaluating stations", unit="st")
         if show_progress
         else stations
@@ -1387,8 +1430,6 @@ def evaluate_all_stations_fast(
             if log_csv and len(pending) >= flush_every:
                 _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
                 pending = []
-            if show_progress:
-                tqdm.write(f"Station {sid}: 0 valid rows (skipped)")
             continue
 
         train_pool = df.loc[is_train_pool & valid_mask_global]
@@ -1429,8 +1470,6 @@ def evaluate_all_stations_fast(
             if log_csv and len(pending) >= flush_every:
                 _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
                 pending = []
-            if show_progress:
-                tqdm.write(f"Station {sid}: empty train (skipped)")
             continue
 
         X_train = train_df[feats].to_numpy(copy=False)
@@ -1499,13 +1538,6 @@ def evaluate_all_stations_fast(
             _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
             pending = []
 
-        if show_progress:
-            tqdm.write(
-                f"Station {sid}: {sec:.2f}s  "
-                f"(train={len(train_df):,}  test={len(test_df):,} "
-                f"incl={pct:.1f}%)"
-            )
-
     if log_csv and pending:
         _append_rows_to_csv(pending, log_csv, header_written_flag=header_flag)
 
@@ -1514,9 +1546,12 @@ def evaluate_all_stations_fast(
 
     if show_progress:
         total_sec = time.time() - t_all0
-        tqdm.write(
-            f"Done. {len(stations)} stations in {total_sec:.1f}s "
-            f"(avg {total_sec / max(1, len(stations)):.2f}s/station)."
+        tqdm(
+            [],
+            desc=(
+                f"Done. {len(stations)} stations in {total_sec:.1f}s "
+                f"(avg {total_sec / max(1, len(stations)):.2f}s/station)."
+            ),
         )
     return result_df
 
@@ -1544,7 +1579,7 @@ def export_full_series_station(
     end: str = "2023-12-31",
     train_start: Optional[str] = None,
     train_end: Optional[str] = None,
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=200,
         max_depth=None,
         random_state=42,
@@ -1643,7 +1678,7 @@ def export_full_series_batch(
     data: pd.DataFrame,
     *,
     station_ids: Optional[Iterable[int]] = None,
-    prefix: Optional[Iterable[str] | str] = None,
+    prefix: Optional[Union[Iterable[str], str]] = None,
     regex: Optional[str] = None,
     custom_filter: Optional[Callable[[int], bool]] = None,
     id_col: str = "station",
@@ -1656,7 +1691,7 @@ def export_full_series_batch(
     end: str = "2023-12-31",
     train_start: Optional[str] = None,
     train_end: Optional[str] = None,
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=200,
         max_depth=None,
         random_state=42,
@@ -1674,7 +1709,6 @@ def export_full_series_batch(
     show_progress: bool = True,
     combine_output_path: Optional[str] = None,
     combine_format: str = "csv",
-    combine_parquet_compression: str = "snappy",
     combine_schema: str = "input_like",
     include_target_pct: float = 0.0,
     include_target_seed: int = 42,
@@ -1721,8 +1755,8 @@ def export_full_series_batch(
         if combine_format.lower() == "csv" and os.path.exists(combine_output_path):
             os.remove(combine_output_path)
 
-    rows: List[Dict] = []
-    it = (
+    rows: List[Dict[str, object]] = []
+    it: Iterable[int] = (
         tqdm(stations, desc="Exporting full series", unit="st")
         if show_progress
         else stations
@@ -1771,9 +1805,21 @@ def export_full_series_batch(
             # Optional combined output
             if combine_output_path is not None:
                 st_coords = df_local[df_local[id_col] == sid]
-                lat0 = st_coords[lat_col].median() if lat_col in st_coords else np.nan
-                lon0 = st_coords[lon_col].median() if lon_col in st_coords else np.nan
-                alt0 = st_coords[alt_col].median() if alt_col in st_coords else np.nan
+                lat0 = (
+                    float(st_coords[lat_col].median())
+                    if lat_col in st_coords
+                    else np.nan
+                )
+                lon0 = (
+                    float(st_coords[lon_col].median())
+                    if lon_col in st_coords
+                    else np.nan
+                )
+                alt0 = (
+                    float(st_coords[alt_col].median())
+                    if alt_col in st_coords
+                    else np.nan
+                )
 
                 if combine_schema == "input_like":
                     part = pd.DataFrame(
@@ -1801,7 +1847,9 @@ def export_full_series_batch(
                         part["y_true"].notna(),
                         part["y_pred_full"],
                     )
-                    part = part[["station", "y_pred_full", "y_true", date_col, target_col]]
+                    part = part[
+                        ["station", "y_pred_full", "y_true", date_col, target_col]
+                    ]
                 else:  # pragma: no cover
                     raise ValueError(
                         "combine_schema must be 'input_like' or 'compact'."
@@ -1869,7 +1917,7 @@ def export_full_series_batch(
         big.to_parquet(
             combine_output_path,
             index=False,
-            compression=combine_parquet_compression,
+            compression=parquet_compression,
         )
 
     manifest = pd.DataFrame(rows)
@@ -1901,7 +1949,7 @@ def loso_predict_full_series_fast(
     train_start: Optional[str] = None,  # optional training window
     train_end: Optional[str] = None,
     # model
-    rf_params: Dict = dict(
+    rf_params: Dict[str, object] = dict(
         n_estimators=200,
         max_depth=None,
         random_state=42,
@@ -1920,7 +1968,7 @@ def loso_predict_full_series_fast(
     save_series_path: Optional[str] = None,
     save_metrics_path: Optional[str] = None,
     parquet_compression: str = "snappy",
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], object, List[str]]:
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], RandomForestRegressor, List[str]]:
     """
     Fast LOSO full-series prediction for one station.
 
@@ -1967,8 +2015,12 @@ def loso_predict_full_series_fast(
     train_base["month"] = train_base[date_col].dt.month
     train_base["doy"] = train_base[date_col].dt.dayofyear
     if add_cyclic:
-        train_base["doy_sin"] = np.sin(2 * np.pi * train_base["doy"] / 365.25)
-        train_base["doy_cos"] = np.cos(2 * np.pi * train_base["doy"] / 365.25)
+        train_base["doy_sin"] = np.sin(
+            2.0 * np.pi * train_base["doy"].to_numpy(dtype=float) / 365.25
+        )
+        train_base["doy_cos"] = np.cos(
+            2.0 * np.pi * train_base["doy"].to_numpy(dtype=float) / 365.25
+        )
 
     resolved_vars = _resolve_columns(train_base, var_cols)
 
@@ -2052,11 +2104,15 @@ def loso_predict_full_series_fast(
     synth["month"] = synth[date_col].dt.month
     synth["doy"] = synth[date_col].dt.dayofyear
     if add_cyclic:
-        synth["doy_sin"] = np.sin(2 * np.pi * synth["doy"] / 365.25)
-        synth["doy_cos"] = np.cos(2 * np.pi * synth["doy"] / 365.25)
+        synth["doy_sin"] = np.sin(
+            2.0 * np.pi * synth["doy"].to_numpy(dtype=float) / 365.25
+        )
+        synth["doy_cos"] = np.cos(
+            2.0 * np.pi * synth["doy"].to_numpy(dtype=float) / 365.25
+        )
 
-    #y_pred_full = model.predict(synth[feats])
-    y_pred_full = model.predict(synth[feats].to_numpy(copy=False))
+    X_synth = synth[feats].to_numpy(copy=False)
+    y_pred_full = model.predict(X_synth)
     full_df = synth[[date_col, "station"]].copy()
     full_df["y_pred_full"] = y_pred_full
 
@@ -2121,7 +2177,7 @@ def plot_compare_obs_rf_nasa(
     rf_value_col: Optional[str] = "y_pred_full",
     rf_label: Optional[str] = "RF",
     # extra external source
-    extra: Optional[Union[pd.DataFrame, pd.Series, np.ndarray, list]] = None,
+    extra: Optional[Union[pd.DataFrame, pd.Series, np.ndarray, List[float]]] = None,
     extra_date_col: str = "date",
     extra_value_col: Optional[str] = None,
     extra_label: str = "External",
@@ -2142,10 +2198,10 @@ def plot_compare_obs_rf_nasa(
     date_fmt: Optional[str] = None,
     save_to: Optional[str] = None,
     # style dictionaries
-    obs_style: Optional[Dict] = None,
-    nasa_style: Optional[Dict] = None,
-    rf_style: Optional[Dict] = None,
-    extra_style: Optional[Dict] = None,
+    obs_style: Optional[Dict[str, object]] = None,
+    nasa_style: Optional[Dict[str, object]] = None,
+    rf_style: Optional[Dict[str, object]] = None,
+    extra_style: Optional[Dict[str, object]] = None,
 ) -> Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, Dict[str, Dict[str, float]]]:
     """
     Plot Observed vs RF vs NASA (plus an optional fourth external series) and
@@ -2191,7 +2247,11 @@ def plot_compare_obs_rf_nasa(
             s_ = s_.rolling(smooth, min_periods=1, center=True).mean()
         return s_
 
-    def _to_series(obj, dcol: str, vcol: Optional[str]) -> pd.Series:
+    def _to_series(
+        obj: Union[pd.DataFrame, pd.Series, np.ndarray, List[float], None],
+        dcol: str,
+        vcol: Optional[str],
+    ) -> pd.Series:
         """Resolve a DataFrame/Series/array into a Series indexed by datetime."""
         if obj is None:
             return pd.Series(dtype=float)
@@ -2271,17 +2331,21 @@ def plot_compare_obs_rf_nasa(
 
     def _pair_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
         pair = pd.concat([a, b], axis=1, join="inner").dropna()
-        if len(pair) < 2 or float(np.var(pair.iloc[:, 0])) == 0.0:
+        if len(pair) == 0:
             return dict(MAE=np.nan, RMSE=np.nan, R2=np.nan)
-        return {
-            "MAE": mean_absolute_error(pair.iloc[:, 0], pair.iloc[:, 1]),
-            "RMSE": mean_squared_error(
-                pair.iloc[:, 0],
-                pair.iloc[:, 1],
-                squared=False,
-            ),
-            "R2": r2_score(pair.iloc[:, 0], pair.iloc[:, 1]),
-        }
+        y1 = pair.iloc[:, 0].to_numpy(dtype=float)
+        y2 = pair.iloc[:, 1].to_numpy(dtype=float)
+        diff = y1 - y2
+        mae = float(np.mean(np.abs(diff)))
+        rmse = float(np.sqrt(np.mean(diff * diff)))
+        if len(y1) < 2 or float(np.var(y1)) == 0.0:
+            if np.allclose(y1, y2, equal_nan=False):
+                r2 = 1.0
+            else:
+                r2 = np.nan
+        else:
+            r2 = float(r2_score(y1, y2))
+        return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
     # ------------------------ resample / smooth ------------------------
     for k in list(series.keys()):
