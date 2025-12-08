@@ -5,23 +5,100 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "MEXsrfdcrPy"
 version = "0.1.0"
-description = "Spatial Random Forest for Daily Climate Records Reconstruction in Mexico"
+description = "Spatial Random Forests for Daily Climate Records Reconstruction in Mexico"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
-authors = [{name = "Hugo Antonio-Fernández"}]
+license = { file = "LICENSE" }
+
+authors = [
+  { name = "Hugo Antonio-Fernández" },
+  { name = "Humberto Vaquera-Huerta" },
+  { name = "Moisés Michel Rosengaus-Moshinsky" },
+  { name = "Paulino Pérez-Rodríguez" },
+  { name = "José Crossa" },
+]
+
+maintainers = [
+  { name = "Hugo Antonio-Fernández" }
+]
+
+keywords = [
+  "climate",
+  "precipitation",
+  "temperature",
+  "evaporation",
+  "random forest",
+  "spatial interpolation",
+  "missing data",
+  "mexico",
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Atmospheric Science",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
 dependencies = [
+  "numpy>=1.21",
   "pandas>=1.5",
-  "numpy>=1.23",
   "scikit-learn>=1.2",
-  "matplotlib>=3.7",
-  "tqdm>=4.65",
-  "pyarrow>=12"
+  "joblib>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "black>=23.0",
+  "ruff>=0.4",
+  "mypy>=1.0",
+]
+docs = [
+  "sphinx>=7.0",
+  "myst-parser>=2.0",
+]
+grid = [
+  "pyarrow>=12.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/sasoryhaf91/MEXsrfdcrPy"
-Issues   = "https://github.com/sasoryhaf91/MEXsrfdcrPy/issues"
+Repository = "https://github.com/sasoryhaf91/MEXsrfdcrPy"
+Issues = "https://github.com/sasoryhaf91/MEXsrfdcrPy/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["MEXsrfdcrPy*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+ignore_missing_imports = true

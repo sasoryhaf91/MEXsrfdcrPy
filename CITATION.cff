@@ -1,19 +1,67 @@
 cff-version: 1.2.0
-title: "MEXsrfdcrPy: Spatial Random Forest for Daily Climate Records Reconstruction in Mexico"
-message: "If you use this software, please cite it as below."
+message: "If you use this software, please cite it using the following metadata."
+title: "MEXsrfdcrPy: Spatial Random Forests for Daily Climate Records Reconstruction in Mexico"
 type: software
+version: "0.1.0"
+license: MIT
+abstract: >
+  MEXsrfdcrPy is a Python package for reconstructing daily climate station
+  records using spatial Random Forest models trained only on latitude, longitude,
+  altitude, and time features. A single global model can be used to fill gaps in
+  precipitation, temperature, or evaporation series, evaluate performance
+  station by station, and generate gridded climate fields over arbitrary spatial
+  resolutions in Mexico and beyond.
 authors:
-  - family-names: "Antonio-Fernandez"
+  - family-names: "Antonio-Fernández"
     given-names: "Hugo"
     orcid: "https://orcid.org/0000-0002-5355-8476"
+    affiliation: "Colegio de Postgraduados, México; Universidad Mexiquense del Bicentenario, México"
+  - family-names: "Vaquera-Huerta"
+    given-names: "Humberto"
+    orcid: "https://orcid.org/0000-0002-2805-804X"
+    affiliation: "Colegio de Postgraduados, México"
+  - family-names: "Rosengaus-Moshinsky"
+    given-names: "Moisés Michel"
+    affiliation: "Independent Consultant"
+  - family-names: "Pérez-Rodríguez"
+    given-names: "Paulino"
+    orcid: "https://orcid.org/0000-0002-3202-1784"
+    affiliation: "Colegio de Postgraduados, México"
+  - family-names: "Crossa"
+    given-names: "José"
+    orcid: "https://orcid.org/0000-0001-9429-5855"
+    affiliation: "CIMMYT, México"
 repository-code: "https://github.com/sasoryhaf91/MEXsrfdcrPy"
-license: "MIT"
+url: "https://github.com/sasoryhaf91/MEXsrfdcrPy"
 keywords:
-  - random forest
   - climate
-  - rainfall
+  - meteorology
+  - precipitation
   - temperature
-  - land evaporation
+  - evaporation
+  - random forest
+  - machine learning
   - Mexico
-version: "0.1.0"
-date-released: "2025-01-01"
+  - missing data
+  - spatial interpolation
+preferred-citation:
+  type: article
+  title: "MEXsrfdcrPy: Spatial Random Forests for Daily Climate Records Reconstruction in Mexico"
+  authors:
+    - family-names: "Antonio-Fernández"
+      given-names: "Hugo"
+      orcid: "https://orcid.org/0000-0002-5355-8476"
+    - family-names: "Vaquera-Huerta"
+      given-names: "Humberto"
+      orcid: "https://orcid.org/0000-0002-2805-804X"
+    - family-names: "Rosengaus-Moshinsky"
+      given-names: "Moisés Michel"
+    - family-names: "Pérez-Rodríguez"
+      given-names: "Paulino"
+      orcid: "https://orcid.org/0000-0002-3202-1784"
+    - family-names: "Crossa"
+      given-names: "José"
+      orcid: "https://orcid.org/0000-0001-9429-5855"
+  journal: "Journal of Open Source Software"
+  year: 2025
+  notes: "In review"
