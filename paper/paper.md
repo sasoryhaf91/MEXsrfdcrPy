@@ -1,54 +1,72 @@
 ---
-title: 'MEXsrfdcrPy: Spatial Random Forest for Daily Climate Records Reconstruction in Mexico'
+title: "MEXsrfdcrPy: Spatial Random Forests for Daily Climate Records Reconstruction in Mexico"
 tags:
   - Python
+  - climatology
+  - meteorology
+  - spatial interpolation
+  - missing data
   - random forest
-  - climate
-  - Mexico
-  - rainfall 
-  - temperature
-  - land evaporation
+  - open science
 authors:
-  - name: Hugo Antonio-Fernandez
-    orcid: 0000-0002-5355-8476
+  - name: "Hugo Antonio-Fernández"
+    orcid: "0000-0002-5355-8476"
+    affiliation: "1, 2"
+  - name: "Humberto Vaquera-Huerta"
+    orcid: "0000-0002-2805-804X"
     affiliation: 1
+  - name: "Moisés Michel Rosengaus-Moshinsky"
+    affiliation: 3
+  - name: "Paulino Pérez-Rodríguez"
+    orcid: "0000-0002-3202-1784"
+    affiliation: 1
+  - name: "José Crossa"
+    orcid: "0000-0001-9429-5855"
+    affiliation: 4
 affiliations:
-  - name: Colegio de Postgraduados, Universidad Mexiquense del Bicentenario
+  - name: "Colegio de Postgraduados, México"
     index: 1
-date: 2025-01-01
+  - name: "Universidad Mexiquense del Bicentenario, México"
+    index: 2
+  - name: "Independent Consultant"
+    index: 3
+  - name: "CIMMYT, México"
+    index: 4
+date: 2025-12-09
 bibliography: paper.bib
 ---
 
-# Summary
+# Summary  
 
-`MEXsrfdcrPy` is a Python package to train and evaluate spatial random forest models for reconstructing daily climate records using station metadata (latitude, longitude, altitude), optional covariates (e.g., gridded predictors), and a leave-one-station-out (LOSO) validation. It targets fast exploration, neighbor-aware training, and grid-based diagnostics.
+Daily climate station records underpin hydrological design, agricultural planning and climate-risk assessment, yet long series are almost always affected by gaps, relocations and inconsistent maintenance [@Menne2012]. In México, the national network maintained by the Servicio Meteorológico Nacional (SMN) comprises thousands of stations with heterogeneous length and completeness, complicating nationwide analyses and the calibration of gridded products [@CONAGUA2012SMN135].
+
+**MEXsrfdcrPy** is a Python package that addresses this problem by training **one global random forest model** on all available daily observations using only geographic coordinates and calendar information—latitude, longitude, elevation and time—and then using this model to reconstruct missing values, quantify spatial interpolation skill station by station, and generate climate grids at user-defined resolutions. The same workflow applies to daily precipitation, minimum and maximum temperature, and evaporation.
+
+The package builds on NumPy, pandas and scikit-learn [@Harris2020; @McKinney2010; @Pedregosa2011] and is designed for interactive notebooks, scripted workflows and large-scale jobs on platforms such as Kaggle. MEXsrfdcrPy forms the spatial interpolation layer, with calendar-based temporal features, of a broader open-source ecosystem for Mexican climate data, complementing tools for station-data access and local spatial–temporal imputation [@Antonio-Fernandez_2025_SMNdataR; @Antonio-Fernandez2025_MissClimatePy].
 
 # Statement of need
 
-Many climate applications require temporally complete daily series for precipitation and temperature. Observational station networks are spatially heterogeneous and exhibit missing values. `MEXsrfdcrPy` implements an efficient and reproducible workflow to *reconstruct* daily values at a given station using neighboring stations, with options to include a percent of the target station samples for sensitivity analyses. It provides scalable evaluation (fast LOSO), spatial filtering by nearest neighbors, and hooks to integrate gridded predictors.
+Spatio-temporal interpolation of station data is commonly performed with kriging, inverse distance weighting or thin-plate splines [@Hijmans2005; @Hofstra2008]. These methods can yield high-quality maps but often require variable-specific configuration and explicit covariance modeling. In parallel, machine-learning approaches—particularly random forests—have become popular for spatial prediction because they capture nonlinear responses and interactions without strong distributional assumptions [@Breiman2001; @Hengl2018]. Many such applications, however, rely on rich sets of auxiliary predictors that are not always available at station locations or for long historical periods.
 
-# Research objectives
+MEXsrfdcrPy targets a complementary use case: **reconstructing daily station series and generating gridded fields using only coordinates and time**. The package assumes that a substantial fraction of the climatological signal can be learned from latitude, longitude, elevation and day of year when training data aggregate decades of observations from a dense national network. This design makes the method easy to deploy across variables and periods, avoids dependence on external reanalyses or remote-sensing products, and yields reusable global models that can be archived with DOIs and shared between projects. The approach is suited to national and regional studies that require transparent reconstruction of long daily series for crop modeling, drought analysis or climate-change attribution [@Xu2024DeepLearningClimate; @Ruane2015AgMERRA].
 
-The package aims to: (i) enable fast LOSO evaluation with neighbor constraints, (ii) quantify expected reconstruction error as a function of station density/distance, (iii) generate full daily series predictions, and (iv) provide reproducible tables and maps that support network planning and uncertainty communication.
+# Model and implementation
 
-# Methodology
+At its core, MEXsrfdcrPy fits a spatial random forest to a long-format daily table with station identifier, date, latitude, longitude, elevation and a single numeric target. Time is represented through year, month and day of year, with optional sinusoidal terms for the annual cycle. A single `RandomForestRegressor` [@Breiman2001; @Pedregosa2011] is trained using all stations that exceed a user-defined threshold of valid observations within a specified training window, and the fitted model plus metadata—column names, feature set, training period and station coverage—are persisted as joblib and JSON artifacts for reproducibility and reuse.
 
-We use ensemble tree models (Random Forest) for daily regression tasks. For each target station, the training pool is composed of neighboring stations or the entire network (excluding the target), with optional inclusion of a small percentage of target observations for controlled leakage tests. The model uses station metadata and calendar features (year, month, day of year, optional cyclic encoding). Metrics are reported daily, monthly, and annually (MAE, RMSE, R²), with robust handling of edge cases (e.g., zero variance in the target).
+The package is organized around two high-level modules. The **`loso`** module implements leave-one-station-out (LOSO) experiments: each station is excluded from training and then predicted across the evaluation period. Results are summarized in tidy tables with three metrics—mean absolute error (MAE), root mean squared error (RMSE) and the coefficient of determination (R²)—computed on daily values and on user-defined temporal aggregations, following best practices for spatial cross-validation [@Roberts2017]. The **`grid`** module reuses a single global model to predict any station grid or regular mesh defined by latitude, longitude and elevation, over any compatible date interval. Internally, the package uses NumPy arrays for fitting and prediction and delegates parallelization to scikit-learn’s multi-core implementation, keeping dependencies minimal and installation straightforward.
 
-# Implementation
+# Examples
 
-The core evaluates stations with a single-pass preprocessing and buffered logging. Spatial neighbor selection is accelerated via KDTree over station centroids (lat/lon). The package supports full-series prediction in user-defined date ranges, and exports results to CSV/Parquet. Gridded predictors can be plugged as additional features. The API favors batch evaluation and easy integration with notebooks and workflows.
+MEXsrfdcrPy is illustrated using a 1991–2020 SMN daily dataset for México [@AntonioFernandez2025SMN]. A typical analysis first runs LOSO experiments over a region to quantify station-by-station MAE, RMSE and R², and then trains a global model on the full national network to generate continuous fields on a fine grid for the same period.
+@fig-station11020 shows a representative station-level comparison produced directly with the package plotting utilities. Daily rainfall at an SMN station is contrasted with three alternative sources of information: an external gridded product from NASA POWER (variable PRECTOTCORR) [@Stackhouse2018], a local spatial–temporal random forest model obtained with MissClimatePy [@Antonio-Fernandez2025_MissClimatePy], and a grid-based global model derived from MEXsrfdcrPy applied to a high-resolution mesh. The legend reports MAE, RMSE and R² for each series, showing that, at this station, the global spatial random forest can match or outperform both the external product and the local model. The figure thus illustrates the dual role of MEXsrfdcrPy as a reconstruction engine and as a benchmarking tool against existing datasets.
 
-# Validation
+![Daily rainfall at station 11020 (México) comparing observations, NASA POWER precipitation (PRECTOTCORR), a local spatial random forest model (SRFI), and a grid-based global model (Grid Model). The plot is generated with MEXsrfdcrPy, and the legend reports MAE, RMSE and R² for each series.](figures/station_11020_comparison.png){#fig-station11020}
 
-We conduct LOSO experiments across Mexican stations from SMN and NASA-like gridded sources (when available). The package reports expected errors vs. distance-to-nearest station and fraction of network coverage, reproducing typical gradients observed in sparse/denser regions. Results can be summarized as tables and maps to guide network expansion and uncertainty-aware applications.
+# Related work
 
-# Availability
-
-The source code is hosted on GitHub: <https://github.com/sasoryhaf91/MEXsrfdcrPy> and distributed under the MIT license. Example notebooks and scripts (Kaggle-friendly) are provided to reproduce key figures and tables.
+MEXsrfdcrPy sits at the intersection of traditional spatial interpolation, machine-learning-based mapping and open climate-data workflows. It complements geostatistical approaches and global datasets such as WorldClim and CHELSA [@Hijmans2005; @Karger2017] by focusing on the reconstruction of **station series** and by using a single, reusable random forest model trained solely on coordinates and time. The design is inspired by studies demonstrating the strong performance of random forests for spatial and spatio-temporal prediction [@Hengl2018] and by best practices for spatial cross-validation [@Roberts2017]. By building on NumPy, pandas and scikit-learn [@Harris2020; @McKinney2010; @Pedregosa2011] and integrating naturally with Python-based ecosystems for climate and agricultural modeling, MEXsrfdcrPy provides a pragmatic, fully reproducible path from raw, incomplete national station archives to interpolated daily series and high-resolution climate grids.
 
 # Acknowledgements
 
-We thank the open-source community and the maintainers of scientific Python libraries used in this work.
-
-# References
+This work was supported by the Secretaría de Ciencia, Humanidades, Tecnología e Innovación (SECIHTI) through a doctoral scholarship to the first author. We acknowledge Colegio de Postgraduados and Universidad Mexiquense del Bicentenario for institutional support. We also thank the International Maize and Wheat Improvement Center (CIMMYT) for fostering collaboration in open climate and agricultural research.
