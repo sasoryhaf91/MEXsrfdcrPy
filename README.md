@@ -218,7 +218,9 @@ If you use `MEXsrfdcrPy` in your work, please cite the software paper (once acce
 
 > Antonio-Fernández, H., Vaquera-Huerta, H., Rosengaus-Moshinsky, M. M., Pérez-Rodríguez, P., & Crossa, J. (2025). MEXsrfdcrPy: Spatial Random Forests for Daily Climate Records Reconstruction in Mexico. *Journal of Open Source Software*.
 
-**Zenodo record:** (to be added)
+**Zenodo record:**
+
+> Antonio-Fernández, H., Vaquera-Huerta, H., Rosengaus-Moshinsky, M. M., Pérez-Rodríguez, P., & Crossa, J. (2025). MEXsrfdcrPy: Spatial Random Forests for Daily Climate Records Reconstruction in Mexico (v0.1.0). Zenodo. https://doi.org/10.5281/zenodo.17890904
 
 A ready-to-use `CITATION.cff` file is included in the repository.
 
