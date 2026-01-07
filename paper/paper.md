@@ -80,4 +80,6 @@ This software employs classical machine-learning methods, specifically random fo
 
 This work was supported by the Secretaría de Ciencia, Humanidades, Tecnología e Innovación (SECIHTI) through a doctoral scholarship to the first author. We acknowledge Colegio de Postgraduados and Universidad Mexiquense del Bicentenario for institutional support, and CIMMYT for fostering collaboration in open climate and agricultural research.
 
+# References
+
 
